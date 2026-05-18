@@ -1,0 +1,27 @@
+[Unit]
+Description=Sentinel Nexus Light Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sentinelnexus
+Group=sentinelnexus
+EnvironmentFile=/etc/sentinel-nexus-agent/txn-mobile-ussd.env
+ExecStart=/opt/sentinel-nexus-agent/venv/bin/python -m nexus_light_agent --config /etc/sentinel-nexus-agent/txn-mobile-ussd.json
+Restart=always
+RestartSec=15
+Nice=10
+CPUQuota=2%
+MemoryMax=128M
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/sentinel-nexus-agent /var/log/sentinel-nexus-agent
+ReadOnlyPaths=/proc /srv/log /srv/afc
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,57 @@
+{
+  "agent_id": "agent-txn-mobile-ussd-ate-01",
+  "environment": "ate",
+  "nexus_base_url": "http://sentinelops-ai.internal:8010",
+  "agent_token_env": "NEXUS_AGENT_API_TOKEN",
+  "poll_interval_seconds": 30,
+  "heartbeat_interval_seconds": 60,
+  "config_refresh_interval_seconds": 300,
+  "http_timeout_seconds": 5,
+  "state_dir": "/var/lib/sentinel-nexus-agent",
+  "log_file": "/var/log/sentinel-nexus-agent/agent.log",
+  "resource_guard": {
+    "nice": 10,
+    "max_log_bytes_per_cycle": 65536,
+    "max_log_lines_per_cycle": 80,
+    "initial_tail_bytes": 65536,
+    "high_load_per_core": 0.85,
+    "critical_load_per_core": 1.2,
+    "min_available_memory_mb": 1024,
+    "spool_max_records": 200
+  },
+  "command_server": {
+    "enabled": false,
+    "bind_host": "127.0.0.1",
+    "port": 8765,
+    "public_base_url": "http://ate-test-hostname:8765",
+    "request_timeout_seconds": 8
+  },
+  "services": [
+    {
+      "service_id": "txn-mobile-ussd",
+      "service_name": "Mobile Banking USSD",
+      "environment": "ate",
+      "cluster_id": "mobile-banking-ate",
+      "business_flow_id": "mobile-ussd-balance-enquiry",
+      "instance_id": "ussd-ate-test:txn-mobile-ussd",
+      "expected_running": true,
+      "process_match": "txn-mobile-ussd-0.0.1-SNAPSHOT.jar",
+      "log_path": "/srv/log/ate/txn-mobile/txn-mobile-ussd/txn-mobile-ussd-human.log",
+      "healthcheck_url": null,
+      "systemd_unit": null,
+      "restart_command": [],
+      "restart_settle_seconds": 5,
+      "tags": ["mobile-banking", "ussd", "channel"],
+      "analysis_profile": "mobile_ussd",
+      "analysis_config": {
+        "session_expiry_burst_window_seconds": 60,
+        "session_expiry_warn_threshold": 10,
+        "session_expiry_critical_threshold": 30,
+        "session_expiry_min_carriers": 2,
+        "session_expiry_ratio_warn": 0.25,
+        "session_expiry_compact_window_seconds": 10,
+        "session_expiry_compact_threshold": 5
+      }
+    }
+  ]
+}

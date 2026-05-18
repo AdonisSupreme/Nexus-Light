@@ -1,0 +1,76 @@
+# =========================
+# 🐍 Python Bytecode & Cache
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# =========================
+# 🧪 Virtual Environments
+# =========================
+sentinelai/
+venv/
+env/
+.venv/
+.virtualenv/
+.pytest_cache/
+.tmp/
+.vendor/
+nexus_light_agent/
+
+
+# =========================
+# 📦 Dependency & Build Artifacts
+# =========================
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# =========================
+# 🧰 Testing & Coverage
+# =========================
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+
+# =========================
+# 🧠 IDE / Editor Noise
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =========================
+# 🗂 OS / System Files
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# 🔐 Environment & Secrets
+# =========================
+.env
+.env.*
+*.pem
+*.key
+*.crt
+
+# =========================
+# 📜 Logs & Runtime Files
+# =========================
+*.log
+logs/
+
+# =========================
+# 🧭 Misc
+# =========================
+.cache/
+.mypy_cache/
+.pyright/
