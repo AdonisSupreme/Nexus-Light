@@ -1,8 +1,27 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import sys
+from pathlib import Path
+
+
+if __package__ in {None, ""}:
+    package_name = "nexus_light_agent"
+    package_dir = Path(__file__).resolve().parent
+    init_path = package_dir / "__init__.py"
+    spec = importlib.util.spec_from_file_location(
+        package_name,
+        init_path,
+        submodule_search_locations=[str(package_dir)],
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to bootstrap {package_name} from {package_dir}")
+    package = importlib.util.module_from_spec(spec)
+    sys.modules[package_name] = package
+    spec.loader.exec_module(package)
+    __package__ = package_name
 
 from .agent import NexusLightAgent, setup_logging
 from .config import config_template, load_settings
