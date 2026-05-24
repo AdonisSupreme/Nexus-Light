@@ -1,7 +1,7 @@
 {
   "agent_id": "agent-txn-mobile-ussd-ate-01",
   "environment": "ate",
-  "nexus_base_url": "http://sentinelops-ai.internal:8010",
+  "nexus_base_url": "http://192.168.203.53:8010",
   "agent_token_env": "NEXUS_AGENT_API_TOKEN",
   "poll_interval_seconds": 30,
   "heartbeat_interval_seconds": 60,

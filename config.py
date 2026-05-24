@@ -178,9 +178,9 @@ def load_settings(path: str | os.PathLike[str]) -> AgentSettings:
 
 def config_template() -> dict[str, Any]:
     return {
-        "agent_id": "agent-ate-mobile-banking-01",
-        "environment": "ATE",
-        "nexus_base_url": "http://sentinelops-ai.internal:8010",
+        "agent_id": "agent-txn-mobile-ussd-ate-01",
+        "environment": "ate",
+        "nexus_base_url": "http://192.168.203.53:8010",
         "agent_token_env": "NEXUS_AGENT_API_TOKEN",
         "poll_interval_seconds": 30,
         "heartbeat_interval_seconds": 60,
@@ -209,10 +209,10 @@ def config_template() -> dict[str, Any]:
             {
                 "service_id": "txn-mobile-ussd",
                 "service_name": "Mobile Banking USSD",
-                "environment": "ATE",
-                "cluster_id": "mobile-banking-channels",
+                "environment": "ate",
+                "cluster_id": "mobile-banking-ate",
                 "business_flow_id": "mobile-ussd-balance-enquiry",
-                "instance_id": "ate-live:txn-mobile-ussd",
+                "instance_id": "ussd-ate-test:txn-mobile-ussd",
                 "expected_running": True,
                 "process_match": "txn-mobile-ussd-0.0.1-SNAPSHOT.jar",
                 "log_path": "/srv/log/ate/txn-mobile/txn-mobile-ussd/txn-mobile-ussd-human.log",
