@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 import threading
 import time
@@ -16,6 +17,7 @@ from .system import host_snapshot
 MAX_OUTPUT_CHARS = 6000
 RESTART_BLOCKED_TYPES = {"db", "database", "cache", "queue", "auth", "infra"}
 RESTART_CAPABLE_TYPES = {"app", "worker", "gateway", "channel", "channel_adapter", "integration"}
+LOGGER = logging.getLogger("sentinel.nexus.light_agent")
 
 
 class AgentCommandServer:
@@ -47,6 +49,7 @@ class AgentCommandServer:
 
             def do_POST(self) -> None:
                 if not server._authorized(self):
+                    LOGGER.warning("command server rejected unauthorized %s request", self.path.rstrip("/") or "/")
                     server._write_json(self, 401, {"error": "unauthorized"})
                     return
                 payload = server._read_json(self)
@@ -100,17 +103,21 @@ class AgentCommandServer:
         service_id = str(payload.get("service_id") or "")
         operation = str(payload.get("operation") or "restart").lower().strip()
         if operation not in {"start", "stop", "restart"}:
+            LOGGER.warning("control rejected for %s: unsupported operation %s", service_id or "unknown", operation)
             return 400, {"accepted": False, "error": "unsupported_operation", "operation": operation}
         service = self.agent.get_service(service_id)
         if not service:
+            LOGGER.warning("control rejected: unknown service %s", service_id)
             return 404, {"error": f"unknown service {service_id}"}
         contract = self.agent.get_remote_contract(service_id, force=True)
         allowed, reasons = _restart_allowed(contract, service, self.agent.state.data, operation=operation)
         if not allowed:
+            LOGGER.warning("control rejected for %s %s: %s", service_id, operation, "; ".join(reasons))
             return 403, {"accepted": False, "blocked_reasons": reasons, "service_id": service_id}
 
         command = _control_command(service, operation)
         if not command:
+            LOGGER.warning("control rejected for %s %s: no local command or systemd unit configured", service_id, operation)
             return 403, {
                 "accepted": False,
                 "blocked_reasons": [f"No local {operation} command or systemd unit is configured for this service."],
@@ -118,6 +125,7 @@ class AgentCommandServer:
             }
 
         execution_id = f"{operation}-exec-{uuid4()}"
+        LOGGER.info("control accepted for %s %s execution_id=%s command=%s", service_id, operation, execution_id, " ".join(command))
         thread = threading.Thread(
             target=self._run_control_background,
             args=(execution_id, service, payload, command),
@@ -163,6 +171,13 @@ class AgentCommandServer:
         started = datetime.now(timezone.utc)
         result = _run_command(command, timeout_seconds=90)
         time.sleep(max(int(service.restart_settle_seconds), 0))
+        LOGGER.info(
+            "control completed for %s %s execution_id=%s return_code=%s",
+            service.service_id,
+            operation,
+            execution_id,
+            result["return_code"],
+        )
         with self.agent._state_lock:
             history = self.agent.state.data.setdefault("restart_history", {})
             history[service.service_id] = {
