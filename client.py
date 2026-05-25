@@ -32,6 +32,10 @@ class NexusClient:
         agent_id = urllib.parse.quote(str(payload["agent_id"]))
         return self._request("POST", f"/api/v1/nexus/agents/{agent_id}/diagnostic-results", payload)
 
+    def control_result(self, payload: dict[str, Any]) -> dict[str, Any]:
+        agent_id = urllib.parse.quote(str(payload["agent_id"]))
+        return self._request("POST", f"/api/v1/nexus/agents/{agent_id}/control-results", payload)
+
     def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         data = None
         headers = {

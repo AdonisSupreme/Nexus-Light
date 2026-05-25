@@ -11,6 +11,7 @@ from typing import Any
 from uuid import uuid4
 
 from . import __version__
+from .procfs import find_processes
 from .system import host_snapshot
 
 
@@ -181,30 +182,70 @@ class AgentCommandServer:
         started = datetime.now(timezone.utc)
         result = _run_command(command, timeout_seconds=90)
         time.sleep(max(int(service.restart_settle_seconds), 0))
-        LOGGER.info(
-            "control completed for %s %s execution_id=%s return_code=%s",
+        postcheck = _post_control_check(service, operation, result)
+        verified = bool(postcheck.get("success"))
+        history_status = "verified" if verified else ("failed" if result["return_code"] != 0 else "verification_failed")
+        log_method = LOGGER.info if verified else LOGGER.warning
+        log_method(
+            "control completed for %s %s execution_id=%s return_code=%s status=%s postcheck=%s",
             service.service_id,
             operation,
             execution_id,
             result["return_code"],
+            history_status,
+            postcheck.get("message"),
         )
+        completed_at = datetime.now(timezone.utc)
+        result_payload = {
+            "agent_id": self.agent.settings.agent_id,
+            "execution_id": execution_id,
+            "action_execution_id": payload.get("action_execution_id"),
+            "incident_id": payload.get("incident_id"),
+            "service_id": service.service_id,
+            "operation": operation,
+            "timestamp": completed_at.isoformat().replace("+00:00", "Z"),
+            "accepted": True,
+            "successful": verified,
+            "status": history_status,
+            "command": command,
+            "return_code": result["return_code"],
+            "stdout": result["stdout"],
+            "stderr": result["stderr"],
+            "postcheck": postcheck,
+            "metadata": {
+                "approved_by": payload.get("approved_by"),
+                "requested_by": payload.get("requested_by"),
+                "reason": payload.get("reason"),
+                "agent_version": __version__,
+            },
+        }
         with self.agent._state_lock:
             history = self.agent.state.data.setdefault("restart_history", {})
             history[service.service_id] = {
                 "execution_id": execution_id,
                 "operation": operation,
                 "started_at": started.isoformat().replace("+00:00", "Z"),
-                "completed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "completed_at": completed_at.isoformat().replace("+00:00", "Z"),
                 "incident_id": payload.get("incident_id"),
                 "action_execution_id": payload.get("action_execution_id"),
                 "approved_by": payload.get("approved_by"),
                 "command": command,
                 "return_code": result["return_code"],
-                "status": "completed" if result["return_code"] == 0 else "failed",
+                "status": history_status,
+                "verified": verified,
+                "postcheck": postcheck,
                 "stdout": result["stdout"],
                 "stderr": result["stderr"],
             }
             self.agent.state.save()
+        try:
+            self.agent.client.control_result(result_payload)
+        except Exception:
+            with self.agent._state_lock:
+                failed = self.agent.state.data.setdefault("failed_control_results", [])
+                failed.append(result_payload)
+                self.agent.state.data["failed_control_results"] = failed[-50:]
+                self.agent.state.save()
 
     def _authorized(self, handler: BaseHTTPRequestHandler) -> bool:
         token = handler.headers.get("X-Nexus-Agent-Token", "")
@@ -268,8 +309,10 @@ def _restart_allowed(contract: dict[str, Any], local_service: Any, state: dict[s
         reasons.append("Shared database/dependency services are blocked from restart execution.")
     cooldown_minutes = int(restart_policy.get("cooldown_minutes") or 15)
     history = state.get("restart_history", {}).get(local_service.service_id)
-    if history and _inside_cooldown(history.get("completed_at"), cooldown_minutes):
-        reasons.append(f"Restart cooldown is still active for {cooldown_minutes} minutes.")
+    if history and history.get("verified") is True and _inside_cooldown(history.get("completed_at"), cooldown_minutes):
+        last_operation = str(history.get("operation") or "").lower()
+        if not (last_operation == "stop" and operation == "start"):
+            reasons.append(f"Restart cooldown is still active for {cooldown_minutes} minutes.")
     return not reasons, reasons
 
 
@@ -293,6 +336,78 @@ def _control_command(service: Any, operation: str) -> list[str]:
     if service.systemd_unit:
         return ["systemctl", operation, service.systemd_unit]
     return []
+
+
+def _post_control_check(service: Any, operation: str, command_result: dict[str, Any]) -> dict[str, Any]:
+    if command_result["return_code"] != 0:
+        return {
+            "success": False,
+            "status": "command_failed",
+            "message": "The local control command exited with a non-zero return code.",
+            "expected_state": _expected_state(operation),
+            "return_code": command_result["return_code"],
+        }
+
+    if service.process_match:
+        processes = find_processes(service.process_match)
+        process_count = len(processes)
+        if operation == "stop":
+            success = process_count == 0
+            return {
+                "success": success,
+                "status": "verified" if success else "process_still_running",
+                "message": (
+                    "Post-stop verification passed: no matching service process is visible."
+                    if success
+                    else f"Post-stop verification failed: {process_count} matching process(es) are still running."
+                ),
+                "expected_state": "stopped",
+                "process_match": service.process_match,
+                "process_count": process_count,
+                "processes": processes[:5],
+            }
+        success = process_count > 0
+        return {
+            "success": success,
+            "status": "verified" if success else "process_not_running",
+            "message": (
+                f"Post-{operation} verification passed: matching service process is running."
+                if success
+                else f"Post-{operation} verification failed: no matching service process is visible."
+            ),
+            "expected_state": "running",
+            "process_match": service.process_match,
+            "process_count": process_count,
+            "processes": processes[:5],
+        }
+
+    if service.systemd_unit:
+        result = _run_command(["systemctl", "is-active", service.systemd_unit], timeout_seconds=8)
+        active = result["stdout"].strip() == "active"
+        success = not active if operation == "stop" else active
+        return {
+            "success": success,
+            "status": "verified" if success else "systemd_state_mismatch",
+            "message": (
+                f"Post-{operation} verification passed via systemd."
+                if success
+                else f"Post-{operation} verification failed: systemd reports {result['stdout'].strip() or 'unknown'}."
+            ),
+            "expected_state": _expected_state(operation),
+            "systemd_unit": service.systemd_unit,
+            "systemd_is_active": result,
+        }
+
+    return {
+        "success": False,
+        "status": "verification_unavailable",
+        "message": "No process_match or systemd_unit is configured, so Nexus cannot verify the control result.",
+        "expected_state": _expected_state(operation),
+    }
+
+
+def _expected_state(operation: str) -> str:
+    return "stopped" if operation == "stop" else "running"
 
 
 def _execute_diagnostic_command(service: Any, command: dict[str, Any]) -> dict[str, Any]:

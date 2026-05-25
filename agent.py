@@ -93,6 +93,7 @@ class NexusLightAgent:
             self._send_or_spool(report)
 
         self._flush_spool()
+        self._flush_failed_callbacks()
         with self._state_lock:
             self.state.save()
         return reports
@@ -218,6 +219,41 @@ class NexusLightAgent:
                 LOGGER.info("flushed %s spooled probe reports", sent)
         except Exception:
             LOGGER.exception("failed while flushing probe spool")
+
+    def _flush_failed_callbacks(self) -> None:
+        with self._state_lock:
+            diagnostic_results = list(self.state.data.get("failed_diagnostic_results") or [])
+            control_results = list(self.state.data.get("failed_control_results") or [])
+
+        sent_diagnostics = self._flush_callback_batch(
+            diagnostic_results,
+            callback=lambda payload: self.client.diagnostic_results(payload),
+            state_key="failed_diagnostic_results",
+        )
+        sent_controls = self._flush_callback_batch(
+            control_results,
+            callback=lambda payload: self.client.control_result(payload),
+            state_key="failed_control_results",
+        )
+        if sent_diagnostics:
+            LOGGER.info("flushed %s delayed diagnostic result callback(s)", sent_diagnostics)
+        if sent_controls:
+            LOGGER.info("flushed %s delayed control result callback(s)", sent_controls)
+
+    def _flush_callback_batch(self, payloads: list[dict[str, Any]], *, callback: Any, state_key: str) -> int:
+        if not payloads:
+            return 0
+        remaining: list[dict[str, Any]] = []
+        sent = 0
+        for payload in payloads:
+            try:
+                callback(payload)
+                sent += 1
+            except Exception:
+                remaining.append(payload)
+        with self._state_lock:
+            self.state.data[state_key] = remaining[-50:]
+        return sent
 
     def _maybe_send_heartbeats(self, now: float, host: dict[str, Any], pressure: dict[str, Any]) -> None:
         if now - self._last_heartbeat_at < self.settings.heartbeat_interval_seconds:
