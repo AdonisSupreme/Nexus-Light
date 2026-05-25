@@ -273,6 +273,9 @@ class NexusLightAgent:
                 LOGGER.warning("remote config unavailable for %s: %s", service_id, exc)
         return self._remote_contracts.get(service_id, {})
 
+    def get_cached_remote_contract(self, service_id: str) -> dict[str, Any]:
+        return self._remote_contracts.get(service_id, {})
+
     def _handle_stop(self, _signum: int, _frame: object) -> None:
         self._stopping = True
 

@@ -80,7 +80,13 @@ class AgentCommandServer:
         service = self.agent.get_service(service_id)
         if not service:
             return 404, {"error": f"unknown service {service_id}"}
-        contract = self.agent.get_remote_contract(service_id, force=True)
+        contract = self.agent.get_cached_remote_contract(service_id)
+        if not contract:
+            LOGGER.warning("diagnostics rejected for %s: no cached Nexus service contract", service_id)
+            return 503, {
+                "error": "No cached Nexus service contract is available yet. Wait for agent config refresh or restart the light agent after Nexus is reachable.",
+                "service_id": service_id,
+            }
         allowed, reason = _diagnostics_allowed(contract)
         if not allowed:
             return 403, {"error": reason}
@@ -109,7 +115,11 @@ class AgentCommandServer:
         if not service:
             LOGGER.warning("control rejected: unknown service %s", service_id)
             return 404, {"error": f"unknown service {service_id}"}
-        contract = self.agent.get_remote_contract(service_id, force=True)
+        contract = self.agent.get_cached_remote_contract(service_id)
+        if not contract:
+            reason = "No cached Nexus service contract is available yet. Wait for agent config refresh or restart the light agent after Nexus is reachable."
+            LOGGER.warning("control rejected for %s %s: %s", service_id, operation, reason)
+            return 503, {"accepted": False, "blocked_reasons": [reason], "service_id": service_id}
         allowed, reasons = _restart_allowed(contract, service, self.agent.state.data, operation=operation)
         if not allowed:
             LOGGER.warning("control rejected for %s %s: %s", service_id, operation, "; ".join(reasons))
