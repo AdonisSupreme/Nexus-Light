@@ -61,6 +61,10 @@ class AgentCommandServer:
                     status, response = server.request_restart(payload)
                     server._write_json(self, status, response)
                     return
+                if self.path.rstrip("/") == "/control":
+                    status, response = server.request_control(payload)
+                    server._write_json(self, status, response)
+                    return
                 server._write_json(self, 404, {"error": "not_found"})
 
             def log_message(self, _format: str, *_args: Any) -> None:
@@ -89,32 +93,39 @@ class AgentCommandServer:
         return 202, {"accepted": True, "execution_id": request_id, "service_id": service_id}
 
     def request_restart(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        payload = {**payload, "operation": "restart"}
+        return self.request_control(payload)
+
+    def request_control(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         service_id = str(payload.get("service_id") or "")
+        operation = str(payload.get("operation") or "restart").lower().strip()
+        if operation not in {"start", "stop", "restart"}:
+            return 400, {"accepted": False, "error": "unsupported_operation", "operation": operation}
         service = self.agent.get_service(service_id)
         if not service:
             return 404, {"error": f"unknown service {service_id}"}
         contract = self.agent.get_remote_contract(service_id, force=True)
-        allowed, reasons = _restart_allowed(contract, service, self.agent.state.data)
+        allowed, reasons = _restart_allowed(contract, service, self.agent.state.data, operation=operation)
         if not allowed:
             return 403, {"accepted": False, "blocked_reasons": reasons, "service_id": service_id}
 
-        command = _restart_command(service)
+        command = _control_command(service, operation)
         if not command:
             return 403, {
                 "accepted": False,
-                "blocked_reasons": ["No local restart command or systemd unit is configured for this service."],
+                "blocked_reasons": [f"No local {operation} command or systemd unit is configured for this service."],
                 "service_id": service_id,
             }
 
-        execution_id = f"restart-exec-{uuid4()}"
+        execution_id = f"{operation}-exec-{uuid4()}"
         thread = threading.Thread(
-            target=self._run_restart_background,
+            target=self._run_control_background,
             args=(execution_id, service, payload, command),
-            name=f"nexus-restart-{service_id}",
+            name=f"nexus-{operation}-{service_id}",
             daemon=True,
         )
         thread.start()
-        return 202, {"accepted": True, "execution_id": execution_id, "service_id": service_id}
+        return 202, {"accepted": True, "execution_id": execution_id, "service_id": service_id, "operation": operation}
 
     def _run_diagnostics_background(self, request_id: str, service: Any, payload: dict[str, Any]) -> None:
         commands = payload.get("commands") or []
@@ -141,13 +152,14 @@ class AgentCommandServer:
                 self.agent.state.data["failed_diagnostic_results"] = failed[-50:]
                 self.agent.state.save()
 
-    def _run_restart_background(
+    def _run_control_background(
         self,
         execution_id: str,
         service: Any,
         payload: dict[str, Any],
         command: list[str],
     ) -> None:
+        operation = str(payload.get("operation") or "restart").lower()
         started = datetime.now(timezone.utc)
         result = _run_command(command, timeout_seconds=90)
         time.sleep(max(int(service.restart_settle_seconds), 0))
@@ -155,6 +167,7 @@ class AgentCommandServer:
             history = self.agent.state.data.setdefault("restart_history", {})
             history[service.service_id] = {
                 "execution_id": execution_id,
+                "operation": operation,
                 "started_at": started.isoformat().replace("+00:00", "Z"),
                 "completed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "incident_id": payload.get("incident_id"),
@@ -206,7 +219,7 @@ def _diagnostics_allowed(contract: dict[str, Any]) -> tuple[bool, str]:
     return True, ""
 
 
-def _restart_allowed(contract: dict[str, Any], local_service: Any, state: dict[str, Any]) -> tuple[bool, list[str]]:
+def _restart_allowed(contract: dict[str, Any], local_service: Any, state: dict[str, Any], *, operation: str = "restart") -> tuple[bool, list[str]]:
     service = contract.get("service") or {}
     certification = service.get("certification") or {}
     restart_policy = service.get("restart_policy") or {}
@@ -217,7 +230,7 @@ def _restart_allowed(contract: dict[str, Any], local_service: Any, state: dict[s
     if service_type not in RESTART_CAPABLE_TYPES:
         reasons.append(f"Service type {service_type or 'unknown'} is not restart-capable for this agent.")
     if certification.get("lifecycle_stage") != "restart_ready":
-        reasons.append("Service is not certified as restart_ready in Nexus.")
+        reasons.append(f"Service is not certified as restart_ready in Nexus, so {operation} is blocked.")
     if not restart_policy.get("allow_restart", False):
         reasons.append("Restart policy does not allow restart for this service.")
     policy_allowed_types = {str(item).lower() for item in restart_policy.get("allowed_service_types", [])} or RESTART_CAPABLE_TYPES
@@ -245,11 +258,15 @@ def _inside_cooldown(value: str | None, cooldown_minutes: int) -> bool:
     return (datetime.now(timezone.utc) - completed).total_seconds() < cooldown_minutes * 60
 
 
-def _restart_command(service: Any) -> list[str]:
-    if service.restart_command:
+def _control_command(service: Any, operation: str) -> list[str]:
+    if operation == "start" and service.start_command:
+        return list(service.start_command)
+    if operation == "stop" and service.stop_command:
+        return list(service.stop_command)
+    if operation == "restart" and service.restart_command:
         return list(service.restart_command)
     if service.systemd_unit:
-        return ["systemctl", "restart", service.systemd_unit]
+        return ["systemctl", operation, service.systemd_unit]
     return []
 
 
