@@ -314,9 +314,9 @@ def _restart_allowed(contract: dict[str, Any], local_service: Any, state: dict[s
         reasons.append("Shared database/dependency services are blocked from restart execution.")
     cooldown_minutes = int(restart_policy.get("cooldown_minutes") or 15)
     history = state.get("restart_history", {}).get(local_service.service_id)
-    if history and history.get("verified") is True and _inside_cooldown(history.get("completed_at"), cooldown_minutes):
+    if operation == "restart" and history and history.get("verified") is True and _inside_cooldown(history.get("completed_at"), cooldown_minutes):
         last_operation = str(history.get("operation") or "").lower()
-        if not (last_operation == "stop" and operation == "start"):
+        if last_operation == "restart":
             reasons.append(f"Restart cooldown is still active for {cooldown_minutes} minutes.")
     return not reasons, reasons
 
