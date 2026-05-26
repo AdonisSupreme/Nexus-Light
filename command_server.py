@@ -489,11 +489,17 @@ def _post_control_check(service: Any, operation: str, command_result: dict[str, 
     if command_result["return_code"] != 0:
         stderr = str(command_result.get("stderr") or "").strip()
         stdout = str(command_result.get("stdout") or "").strip()
+        privilege_hint = (
+            " The light agent user does not have OS permission to control the target process; configure the root-owned sudo allowlist helper for this service."
+            if "Permission denied killing pid" in stderr
+            else ""
+        )
         return {
             "success": False,
             "status": "command_failed",
             "message": "The local control command exited with a non-zero return code."
-            + (f" stderr: {stderr}" if stderr else f" stdout: {stdout}" if stdout else ""),
+            + (f" stderr: {stderr}" if stderr else f" stdout: {stdout}" if stdout else "")
+            + privilege_hint,
             "expected_state": _expected_state(operation),
             "return_code": command_result["return_code"],
         }
