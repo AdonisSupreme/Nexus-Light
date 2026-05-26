@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import signal
 import subprocess
 import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -18,6 +21,7 @@ from .system import host_snapshot
 MAX_OUTPUT_CHARS = 6000
 RESTART_BLOCKED_TYPES = {"db", "database", "cache", "queue", "auth", "infra"}
 RESTART_CAPABLE_TYPES = {"app", "worker", "gateway", "channel", "channel_adapter", "integration"}
+BUILTIN_SPRING_BOOT_CONTROL = "__nexus_builtin_spring_boot_jar__"
 LOGGER = logging.getLogger("sentinel.nexus.light_agent")
 
 
@@ -126,12 +130,12 @@ class AgentCommandServer:
             LOGGER.warning("control rejected for %s %s: %s", service_id, operation, "; ".join(reasons))
             return 403, {"accepted": False, "blocked_reasons": reasons, "service_id": service_id}
 
-        command = _control_command(service, operation)
+        command = _control_command(service, operation, contract)
         if not command:
             LOGGER.warning("control rejected for %s %s: no local command or systemd unit configured", service_id, operation)
             return 403, {
                 "accepted": False,
-                "blocked_reasons": [f"No local {operation} command or systemd unit is configured for this service."],
+                "blocked_reasons": [f"No local {operation} command, systemd unit, or Spring Boot jar control metadata is configured for this service."],
                 "service_id": service_id,
             }
 
@@ -139,7 +143,7 @@ class AgentCommandServer:
         LOGGER.info("control accepted for %s %s execution_id=%s command=%s", service_id, operation, execution_id, " ".join(command))
         thread = threading.Thread(
             target=self._run_control_background,
-            args=(execution_id, service, payload, command),
+            args=(execution_id, service, payload, command, contract),
             name=f"nexus-{operation}-{service_id}",
             daemon=True,
         )
@@ -177,10 +181,11 @@ class AgentCommandServer:
         service: Any,
         payload: dict[str, Any],
         command: list[str],
+        contract: dict[str, Any],
     ) -> None:
         operation = str(payload.get("operation") or "restart").lower()
         started = datetime.now(timezone.utc)
-        result = _run_command(command, timeout_seconds=90)
+        result, executed_command = _run_control_command(service, contract, operation, command)
         time.sleep(max(int(service.restart_settle_seconds), 0))
         postcheck = _post_control_check(service, operation, result)
         verified = bool(postcheck.get("success"))
@@ -207,7 +212,7 @@ class AgentCommandServer:
             "accepted": True,
             "successful": verified,
             "status": history_status,
-            "command": command,
+            "command": executed_command,
             "return_code": result["return_code"],
             "stdout": result["stdout"],
             "stderr": result["stderr"],
@@ -229,7 +234,7 @@ class AgentCommandServer:
                 "incident_id": payload.get("incident_id"),
                 "action_execution_id": payload.get("action_execution_id"),
                 "approved_by": payload.get("approved_by"),
-                "command": command,
+                "command": executed_command,
                 "return_code": result["return_code"],
                 "status": history_status,
                 "verified": verified,
@@ -326,7 +331,7 @@ def _inside_cooldown(value: str | None, cooldown_minutes: int) -> bool:
     return (datetime.now(timezone.utc) - completed).total_seconds() < cooldown_minutes * 60
 
 
-def _control_command(service: Any, operation: str) -> list[str]:
+def _control_command(service: Any, operation: str, contract: dict[str, Any] | None = None) -> list[str]:
     if operation == "start" and service.start_command:
         return list(service.start_command)
     if operation == "stop" and service.stop_command:
@@ -335,15 +340,160 @@ def _control_command(service: Any, operation: str) -> list[str]:
         return list(service.restart_command)
     if service.systemd_unit:
         return ["systemctl", operation, service.systemd_unit]
+    if _spring_boot_control_spec(service, contract):
+        return [BUILTIN_SPRING_BOOT_CONTROL, operation]
     return []
+
+
+def _run_control_command(
+    service: Any,
+    contract: dict[str, Any],
+    operation: str,
+    command: list[str],
+) -> tuple[dict[str, Any], list[str]]:
+    if command[:1] == [BUILTIN_SPRING_BOOT_CONTROL]:
+        return _run_spring_boot_control(service, contract, operation), command
+
+    result = _run_command(command, timeout_seconds=90)
+    if result["return_code"] == 127 and _spring_boot_control_spec(service, contract):
+        LOGGER.warning(
+            "control command failed with 127 for %s %s; falling back to built-in Spring Boot jar control: %s",
+            service.service_id,
+            operation,
+            result.get("stderr") or result.get("stdout") or "no command output",
+        )
+        builtin_command = [BUILTIN_SPRING_BOOT_CONTROL, operation]
+        return _run_spring_boot_control(service, contract, operation), builtin_command
+    return result, command
+
+
+def _spring_boot_control_spec(service: Any, contract: dict[str, Any] | None = None) -> dict[str, str] | None:
+    metadata = ((contract or {}).get("service") or {}).get("metadata") or {}
+    jar_path = str(getattr(service, "jar_path", None) or metadata.get("jar_path") or "").strip()
+    config_path = str(getattr(service, "config_path", None) or metadata.get("config_path") or "").strip()
+    process_match = str(getattr(service, "process_match", None) or metadata.get("process_match") or "").strip()
+    java_bin = str(getattr(service, "java_bin", None) or metadata.get("java_bin") or "java").strip() or "java"
+    if not jar_path or not config_path or not process_match:
+        return None
+    return {
+        "jar_path": jar_path,
+        "config_path": config_path,
+        "process_match": process_match,
+        "java_bin": java_bin,
+    }
+
+
+def _run_spring_boot_control(service: Any, contract: dict[str, Any], operation: str) -> dict[str, Any]:
+    spec = _spring_boot_control_spec(service, contract)
+    if not spec:
+        return {
+            "return_code": 127,
+            "stdout": "",
+            "stderr": "Spring Boot jar control requires jar_path, config_path, and process_match.",
+        }
+
+    stdout: list[str] = []
+    stderr: list[str] = []
+    if operation in {"stop", "restart"}:
+        stop_result = _stop_matched_processes(spec["process_match"])
+        stdout.extend(stop_result["stdout"])
+        stderr.extend(stop_result["stderr"])
+        if stop_result["return_code"] != 0:
+            return {
+                "return_code": stop_result["return_code"],
+                "stdout": _truncate("\n".join(stdout)),
+                "stderr": _truncate("\n".join(stderr)),
+            }
+        if operation == "stop":
+            return {"return_code": 0, "stdout": _truncate("\n".join(stdout)), "stderr": _truncate("\n".join(stderr))}
+        time.sleep(2)
+
+    if operation in {"start", "restart"}:
+        start_result = _start_spring_boot_service(spec)
+        stdout.extend(start_result["stdout"])
+        stderr.extend(start_result["stderr"])
+        return {
+            "return_code": start_result["return_code"],
+            "stdout": _truncate("\n".join(stdout)),
+            "stderr": _truncate("\n".join(stderr)),
+        }
+
+    return {"return_code": 400, "stdout": "", "stderr": f"Unsupported operation {operation}"}
+
+
+def _stop_matched_processes(process_match: str) -> dict[str, Any]:
+    processes = find_processes(process_match)
+    if not processes:
+        return {"return_code": 0, "stdout": [f"{process_match} is already stopped."], "stderr": []}
+
+    stdout: list[str] = []
+    stderr: list[str] = []
+    for process in processes:
+        pid = int(process["pid"])
+        try:
+            os.kill(pid, signal.SIGKILL)
+            stdout.append(f"Sent SIGKILL to pid {pid}.")
+        except ProcessLookupError:
+            stdout.append(f"pid {pid} already exited.")
+        except PermissionError as exc:
+            stderr.append(f"Permission denied killing pid {pid}: {exc}")
+        except OSError as exc:
+            stderr.append(f"Failed killing pid {pid}: {exc}")
+
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if not find_processes(process_match):
+            return {"return_code": 0, "stdout": [*stdout, f"{process_match} stopped."], "stderr": stderr}
+        time.sleep(0.5)
+
+    remaining = find_processes(process_match)
+    stderr.append(f"{len(remaining)} matching process(es) still running after SIGKILL.")
+    return {"return_code": 1, "stdout": stdout, "stderr": stderr}
+
+
+def _start_spring_boot_service(spec: dict[str, str]) -> dict[str, Any]:
+    existing = find_processes(spec["process_match"])
+    if existing:
+        return {
+            "return_code": 0,
+            "stdout": [f"{spec['process_match']} is already running with {len(existing)} matching process(es)."],
+            "stderr": [],
+        }
+    jar = Path(spec["jar_path"])
+    config = Path(spec["config_path"])
+    if not jar.exists():
+        return {"return_code": 127, "stdout": [], "stderr": [f"Jar path does not exist: {jar}"]}
+    if not config.exists():
+        return {"return_code": 127, "stdout": [], "stderr": [f"Spring config path does not exist: {config}"]}
+    command = [
+        spec["java_bin"],
+        "-jar",
+        str(jar),
+        f"--spring.config.location={config}",
+    ]
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(jar.parent),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return {"return_code": 127, "stdout": [], "stderr": [str(exc)]}
+    return {"return_code": 0, "stdout": [f"Started {spec['process_match']} with pid {process.pid}."], "stderr": []}
 
 
 def _post_control_check(service: Any, operation: str, command_result: dict[str, Any]) -> dict[str, Any]:
     if command_result["return_code"] != 0:
+        stderr = str(command_result.get("stderr") or "").strip()
+        stdout = str(command_result.get("stdout") or "").strip()
         return {
             "success": False,
             "status": "command_failed",
-            "message": "The local control command exited with a non-zero return code.",
+            "message": "The local control command exited with a non-zero return code."
+            + (f" stderr: {stderr}" if stderr else f" stdout: {stdout}" if stdout else ""),
             "expected_state": _expected_state(operation),
             "return_code": command_result["return_code"],
         }

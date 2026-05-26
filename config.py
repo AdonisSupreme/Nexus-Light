@@ -68,6 +68,9 @@ class ServiceWatch:
     log_path: str | None = None
     healthcheck_url: str | None = None
     systemd_unit: str | None = None
+    jar_path: str | None = None
+    config_path: str | None = None
+    java_bin: str = "java"
     start_command: list[str] = field(default_factory=list)
     stop_command: list[str] = field(default_factory=list)
     restart_command: list[str] = field(default_factory=list)
@@ -94,6 +97,9 @@ class ServiceWatch:
             log_path=payload.get("log_path"),
             healthcheck_url=payload.get("healthcheck_url"),
             systemd_unit=payload.get("systemd_unit"),
+            jar_path=payload.get("jar_path"),
+            config_path=payload.get("config_path"),
+            java_bin=str(payload.get("java_bin") or "java"),
             start_command=[str(item) for item in payload.get("start_command", [])],
             stop_command=[str(item) for item in payload.get("stop_command", [])],
             restart_command=[str(item) for item in payload.get("restart_command", [])],
@@ -222,6 +228,9 @@ def config_template() -> dict[str, Any]:
                 "log_path": "/srv/log/ate/txn-mobile/txn-mobile-ussd/txn-mobile-ussd-human.log",
                 "healthcheck_url": None,
                 "systemd_unit": None,
+                "jar_path": "/srv/afc/txn-mobile/txn-mobile-ussd/lib/txn-mobile-ussd-0.0.1-SNAPSHOT.jar",
+                "config_path": "/srv/afc/txn-mobile/txn-mobile-ussd/etc/application.yml",
+                "java_bin": "java",
                 "start_command": [],
                 "stop_command": [],
                 "restart_command": [],
