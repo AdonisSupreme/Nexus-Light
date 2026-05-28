@@ -14,8 +14,8 @@ from typing import Any
 from uuid import uuid4
 
 from . import __version__
-from .procfs import find_processes
-from .system import host_snapshot
+from .procfs import enrich_cpu_percent, find_processes
+from .system import host_snapshot, resource_pressure
 
 
 MAX_OUTPUT_CHARS = 6000
@@ -151,8 +151,10 @@ class AgentCommandServer:
         return 202, {"accepted": True, "execution_id": execution_id, "service_id": service_id, "operation": operation}
 
     def _run_diagnostics_background(self, request_id: str, service: Any, payload: dict[str, Any]) -> None:
-        commands = payload.get("commands") or []
-        results = [_execute_diagnostic_command(service, command) for command in commands if isinstance(command, dict)]
+        commands = [command for command in (payload.get("commands") or []) if isinstance(command, dict)]
+        if not any(command.get("command_id") == "runtime_status" for command in commands):
+            commands.insert(0, {"command_id": "runtime_status", "label": "Runtime status"})
+        results = [_execute_diagnostic_command(self.agent, service, command) for command in commands]
         result_payload = {
             "agent_id": self.agent.settings.agent_id,
             "bundle_id": payload.get("bundle_id"),
@@ -186,8 +188,7 @@ class AgentCommandServer:
         operation = str(payload.get("operation") or "restart").lower()
         started = datetime.now(timezone.utc)
         result, executed_command = _run_control_command(service, contract, operation, command)
-        time.sleep(max(int(service.restart_settle_seconds), 0))
-        postcheck = _post_control_check(service, operation, result)
+        postcheck = _wait_for_post_control_check(service, operation, result)
         verified = bool(postcheck.get("success"))
         history_status = "verified" if verified else ("failed" if result["return_code"] != 0 else "verification_failed")
         log_method = LOGGER.info if verified else LOGGER.warning
@@ -562,13 +563,50 @@ def _post_control_check(service: Any, operation: str, command_result: dict[str, 
     }
 
 
+def _wait_for_post_control_check(service: Any, operation: str, command_result: dict[str, Any]) -> dict[str, Any]:
+    started = time.monotonic()
+    postcheck = _post_control_check(service, operation, command_result)
+    if command_result["return_code"] != 0 or postcheck.get("success"):
+        postcheck["verification_elapsed_seconds"] = round(time.monotonic() - started, 3)
+        postcheck["verification_timeout_seconds"] = 0
+        return postcheck
+
+    timeout_seconds = _control_postcheck_timeout_seconds(service, operation)
+    deadline = started + timeout_seconds
+    while time.monotonic() < deadline:
+        time.sleep(0.5)
+        postcheck = _post_control_check(service, operation, command_result)
+        if postcheck.get("success"):
+            postcheck["verification_elapsed_seconds"] = round(time.monotonic() - started, 3)
+            postcheck["verification_timeout_seconds"] = timeout_seconds
+            return postcheck
+
+    postcheck["verification_elapsed_seconds"] = round(time.monotonic() - started, 3)
+    postcheck["verification_timeout_seconds"] = timeout_seconds
+    return postcheck
+
+
+def _control_postcheck_timeout_seconds(service: Any, operation: str) -> int:
+    configured = max(int(getattr(service, "restart_settle_seconds", 5) or 5), 1)
+    if operation == "stop":
+        return min(max(configured, 3), 8)
+    return min(max(configured, 5), 30)
+
+
 def _expected_state(operation: str) -> str:
     return "stopped" if operation == "stop" else "running"
 
 
-def _execute_diagnostic_command(service: Any, command: dict[str, Any]) -> dict[str, Any]:
+def _execute_diagnostic_command(agent: Any, service: Any, command: dict[str, Any]) -> dict[str, Any]:
     command_id = command.get("command_id")
     started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    if command_id == "runtime_status":
+        return {
+            "command_id": command_id,
+            "status": "COMPLETED",
+            "started_at": started_at,
+            "output": _runtime_diagnostic_output(agent, service),
+        }
     if command_id == "systemd_status":
         return _diagnostic_command_result(command_id, ["systemctl", "status", service.systemd_unit or "", "--no-pager"], started_at, skip=not service.systemd_unit)
     if command_id == "recent_journal":
@@ -582,6 +620,31 @@ def _execute_diagnostic_command(service: Any, command: dict[str, Any]) -> dict[s
     if command_id == "socket_summary":
         return _diagnostic_command_result(command_id, ["ss", "-lntp"], started_at, skip=False)
     return {"command_id": command_id, "status": "SKIPPED", "started_at": started_at, "reason": "Command is not in the agent allowlist."}
+
+
+def _runtime_diagnostic_output(agent: Any, service: Any) -> dict[str, Any]:
+    host = host_snapshot(service.log_path)
+    pressure = resource_pressure(
+        host,
+        agent.settings.resource_guard.high_load_per_core,
+        agent.settings.resource_guard.min_available_memory_mb,
+    )
+    processes = enrich_cpu_percent(find_processes(service.process_match), agent.state.data)
+    process_count = len(processes)
+    runtime_state = "running" if process_count else "stopped" if service.expected_running else "not_expected"
+    return {
+        "service_id": service.service_id,
+        "service_name": service.service_name,
+        "runtime_state": runtime_state,
+        "status": "up" if process_count else "down" if service.expected_running else "idle",
+        "expected_running": service.expected_running,
+        "process_match": service.process_match,
+        "process_count": process_count,
+        "processes": processes[:10],
+        "host": host,
+        "resource_pressure": pressure,
+        "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
 
 
 def _diagnostic_command_result(command_id: str, command: list[str], started_at: str, *, skip: bool) -> dict[str, Any]:
