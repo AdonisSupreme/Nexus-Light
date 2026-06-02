@@ -71,6 +71,9 @@ class ServiceWatch:
     jar_path: str | None = None
     config_path: str | None = None
     java_bin: str = "java"
+    working_dir: str | None = None
+    readiness_host: str | None = None
+    readiness_port: int | None = None
     start_command: list[str] = field(default_factory=list)
     stop_command: list[str] = field(default_factory=list)
     restart_command: list[str] = field(default_factory=list)
@@ -100,6 +103,9 @@ class ServiceWatch:
             jar_path=payload.get("jar_path"),
             config_path=payload.get("config_path"),
             java_bin=str(payload.get("java_bin") or "java"),
+            working_dir=payload.get("working_dir"),
+            readiness_host=payload.get("readiness_host"),
+            readiness_port=int(payload["readiness_port"]) if payload.get("readiness_port") not in {None, ""} else None,
             start_command=[str(item) for item in payload.get("start_command", [])],
             stop_command=[str(item) for item in payload.get("stop_command", [])],
             restart_command=[str(item) for item in payload.get("restart_command", [])],
@@ -231,6 +237,9 @@ def config_template() -> dict[str, Any]:
                 "jar_path": "/srv/afc/txn-mobile/txn-mobile-ussd/lib/txn-mobile-ussd-0.0.1-SNAPSHOT.jar",
                 "config_path": "/srv/afc/txn-mobile/txn-mobile-ussd/etc/application.yml",
                 "java_bin": "java",
+                "working_dir": "/srv",
+                "readiness_host": "127.0.0.1",
+                "readiness_port": None,
                 "start_command": [],
                 "stop_command": [],
                 "restart_command": [],

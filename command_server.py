@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -11,6 +13,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from . import __version__
@@ -374,6 +377,7 @@ def _spring_boot_control_spec(service: Any, contract: dict[str, Any] | None = No
     config_path = str(getattr(service, "config_path", None) or metadata.get("config_path") or "").strip()
     process_match = str(getattr(service, "process_match", None) or metadata.get("process_match") or "").strip()
     java_bin = str(getattr(service, "java_bin", None) or metadata.get("java_bin") or "java").strip() or "java"
+    working_dir = str(getattr(service, "working_dir", None) or metadata.get("working_dir") or "/srv").strip()
     if not jar_path or not config_path or not process_match:
         return None
     return {
@@ -381,6 +385,7 @@ def _spring_boot_control_spec(service: Any, contract: dict[str, Any] | None = No
         "config_path": config_path,
         "process_match": process_match,
         "java_bin": java_bin,
+        "working_dir": working_dir,
     }
 
 
@@ -466,7 +471,11 @@ def _start_spring_boot_service(spec: dict[str, str]) -> dict[str, Any]:
         return {"return_code": 127, "stdout": [], "stderr": [f"Jar path does not exist: {jar}"]}
     if not config.exists():
         return {"return_code": 127, "stdout": [], "stderr": [f"Spring config path does not exist: {config}"]}
+    working_dir = Path(spec.get("working_dir") or "/srv")
+    if not working_dir.exists():
+        working_dir = jar.parent
     command = [
+        "nohup",
         spec["java_bin"],
         "-jar",
         str(jar),
@@ -475,10 +484,10 @@ def _start_spring_boot_service(spec: dict[str, str]) -> dict[str, Any]:
     try:
         process = subprocess.Popen(
             command,
-            cwd=str(jar.parent),
+            cwd=str(working_dir),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
             start_new_session=True,
         )
     except OSError as exc:
@@ -523,19 +532,31 @@ def _post_control_check(service: Any, operation: str, command_result: dict[str, 
                 "process_count": process_count,
                 "processes": processes[:5],
             }
-        success = process_count > 0
-        return {
-            "success": success,
-            "status": "verified" if success else "process_not_running",
-            "message": (
-                f"Post-{operation} verification passed: matching service process is running."
+        readiness = _service_readiness_check(service) if process_count > 0 else {"required": False, "ready": False}
+        success = process_count > 0 and (not readiness.get("required") or bool(readiness.get("ready")))
+        if process_count > 0 and readiness.get("required") and not readiness.get("ready"):
+            message = (
+                f"Post-{operation} verification waiting: matching service process is running, "
+                f"but TCP readiness on {readiness.get('host')}:{readiness.get('port')} is not open yet."
+            )
+            status = "tcp_not_ready"
+        else:
+            message = (
+                f"Post-{operation} verification passed: matching service process is running"
+                + (" and TCP readiness is open." if readiness.get("required") else ".")
                 if success
                 else f"Post-{operation} verification failed: no matching service process is visible."
-            ),
+            )
+            status = "verified" if success else "process_not_running"
+        return {
+            "success": success,
+            "status": status,
+            "message": message,
             "expected_state": "running",
             "process_match": service.process_match,
             "process_count": process_count,
             "processes": processes[:5],
+            "readiness": readiness,
         }
 
     if service.systemd_unit:
@@ -593,6 +614,81 @@ def _control_postcheck_timeout_seconds(service: Any, operation: str) -> int:
     return min(max(configured, 5), 30)
 
 
+def _service_readiness_check(service: Any) -> dict[str, Any]:
+    port = _service_readiness_port(service)
+    if not port:
+        return {"required": False, "ready": False, "reason": "No readiness port or healthcheck port is configured or discoverable."}
+    hosts = _readiness_hosts(service)
+    started = time.monotonic()
+    errors: list[str] = []
+    for host in hosts:
+        try:
+            with socket.create_connection((host, port), timeout=0.75):
+                return {
+                    "required": True,
+                    "ready": True,
+                    "host": host,
+                    "port": port,
+                    "latency_ms": round((time.monotonic() - started) * 1000, 2),
+                }
+        except OSError as exc:
+            errors.append(f"{host}:{port} {exc}")
+    return {
+        "required": True,
+        "ready": False,
+        "host": hosts[0] if hosts else "127.0.0.1",
+        "port": port,
+        "error": "; ".join(errors[-3:]),
+        "latency_ms": round((time.monotonic() - started) * 1000, 2),
+    }
+
+
+def _readiness_hosts(service: Any) -> list[str]:
+    configured = str(getattr(service, "readiness_host", None) or "").strip()
+    health_host = ""
+    if getattr(service, "healthcheck_url", None):
+        try:
+            health_host = urlparse(str(service.healthcheck_url)).hostname or ""
+        except ValueError:
+            health_host = ""
+    candidates = [configured, health_host, "127.0.0.1", "localhost"]
+    return list(dict.fromkeys([item for item in candidates if item]))
+
+
+def _service_readiness_port(service: Any) -> int | None:
+    configured = getattr(service, "readiness_port", None)
+    if configured:
+        return int(configured)
+    if getattr(service, "healthcheck_url", None):
+        try:
+            parsed = urlparse(str(service.healthcheck_url))
+        except ValueError:
+            parsed = None
+        if parsed and parsed.port:
+            return int(parsed.port)
+    return _discover_spring_server_port(getattr(service, "config_path", None))
+
+
+def _discover_spring_server_port(config_path: str | None) -> int | None:
+    if not config_path:
+        return None
+    path = Path(config_path)
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    direct = re.search(r"(?m)^\s*server\.port\s*:\s*(\d{2,5})\s*$", text)
+    if direct:
+        return int(direct.group(1))
+    server_block = re.search(r"(?ms)^server\s*:\s*\n(?P<body>(?:[ \t]+[^\n]*\n?)+)", text)
+    if not server_block:
+        return None
+    port = re.search(r"(?m)^[ \t]+port\s*:\s*(\d{2,5})\s*$", server_block.group("body"))
+    return int(port.group(1)) if port else None
+
+
 def _expected_state(operation: str) -> str:
     return "stopped" if operation == "stop" else "running"
 
@@ -632,15 +728,17 @@ def _runtime_diagnostic_output(agent: Any, service: Any) -> dict[str, Any]:
     processes = enrich_cpu_percent(find_processes(service.process_match), agent.state.data)
     process_count = len(processes)
     runtime_state = "running" if process_count else "stopped" if service.expected_running else "not_expected"
+    readiness = _service_readiness_check(service) if process_count else {"required": bool(_service_readiness_port(service)), "ready": False}
     return {
         "service_id": service.service_id,
         "service_name": service.service_name,
         "runtime_state": runtime_state,
-        "status": "up" if process_count else "down" if service.expected_running else "idle",
+        "status": "up" if process_count and (not readiness.get("required") or readiness.get("ready")) else "starting" if process_count else "down" if service.expected_running else "idle",
         "expected_running": service.expected_running,
         "process_match": service.process_match,
         "process_count": process_count,
         "processes": processes[:10],
+        "readiness": readiness,
         "host": host,
         "resource_pressure": pressure,
         "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
