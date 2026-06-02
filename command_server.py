@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -178,7 +178,15 @@ class AgentCommandServer:
 
         max_lines = _bounded_int(payload.get("max_lines"), default=120, minimum=20, maximum=300)
         max_bytes = _bounded_int(payload.get("max_bytes"), default=196_608, minimum=8_192, maximum=262_144)
-        return 200, _tail_service_log(service, max_lines=max_lines, max_bytes=max_bytes)
+        cursor = _optional_int(payload.get("cursor"))
+        newest_first = bool(payload.get("newest_first", True))
+        return 200, _tail_service_log(
+            service,
+            max_lines=max_lines,
+            max_bytes=max_bytes,
+            cursor=cursor,
+            newest_first=newest_first,
+        )
 
     def _run_diagnostics_background(self, request_id: str, service: Any, payload: dict[str, Any]) -> None:
         commands = [command for command in (payload.get("commands") or []) if isinstance(command, dict)]
@@ -217,8 +225,54 @@ class AgentCommandServer:
     ) -> None:
         operation = str(payload.get("operation") or "restart").lower()
         started = datetime.now(timezone.utc)
-        result, executed_command = _run_control_command(service, contract, operation, command)
-        postcheck = _wait_for_post_control_check(service, operation, result)
+        progress_sent = False
+
+        def emit_progress(postcheck: dict[str, Any], partial_result: dict[str, Any], *, status: str) -> None:
+            nonlocal progress_sent
+            if progress_sent:
+                return
+            progress_sent = True
+            partial_payload = self._control_result_payload(
+                execution_id,
+                service,
+                payload,
+                operation,
+                command,
+                partial_result,
+                postcheck,
+                started,
+                status=status,
+                successful=bool(postcheck.get("success")),
+                phase="progress",
+            )
+            self._send_control_result_or_spool(partial_payload)
+
+        def observe_progress() -> None:
+            probe_result = {"return_code": 0, "stdout": "", "stderr": ""}
+            postcheck = _post_control_check(service, operation, probe_result)
+            if _postcheck_has_operator_visible_state(operation, postcheck):
+                emit_progress(
+                    postcheck,
+                    probe_result,
+                    status="verified" if postcheck.get("success") else "starting",
+                )
+
+        result, executed_command = _run_control_command(
+            service,
+            contract,
+            operation,
+            command,
+            progress_callback=observe_progress,
+        )
+        immediate_postcheck = _post_control_check(service, operation, result)
+        if not progress_sent and _postcheck_is_transitional(operation, immediate_postcheck, result):
+            emit_progress(immediate_postcheck, result, status="starting")
+
+        postcheck = (
+            immediate_postcheck
+            if result["return_code"] != 0 or immediate_postcheck.get("success")
+            else _wait_for_post_control_check(service, operation, result, initial_postcheck=immediate_postcheck)
+        )
         verified = bool(postcheck.get("success"))
         history_status = "verified" if verified else ("failed" if result["return_code"] != 0 else "verification_failed")
         log_method = LOGGER.info if verified else LOGGER.warning
@@ -232,29 +286,19 @@ class AgentCommandServer:
             postcheck.get("message"),
         )
         completed_at = datetime.now(timezone.utc)
-        result_payload = {
-            "agent_id": self.agent.settings.agent_id,
-            "execution_id": execution_id,
-            "action_execution_id": payload.get("action_execution_id"),
-            "incident_id": payload.get("incident_id"),
-            "service_id": service.service_id,
-            "operation": operation,
-            "timestamp": completed_at.isoformat().replace("+00:00", "Z"),
-            "accepted": True,
-            "successful": verified,
-            "status": history_status,
-            "command": executed_command,
-            "return_code": result["return_code"],
-            "stdout": result["stdout"],
-            "stderr": result["stderr"],
-            "postcheck": postcheck,
-            "metadata": {
-                "approved_by": payload.get("approved_by"),
-                "requested_by": payload.get("requested_by"),
-                "reason": payload.get("reason"),
-                "agent_version": __version__,
-            },
-        }
+        result_payload = self._control_result_payload(
+            execution_id,
+            service,
+            payload,
+            operation,
+            executed_command,
+            result,
+            postcheck,
+            completed_at,
+            status=history_status,
+            successful=verified,
+            phase="final",
+        )
         with self.agent._state_lock:
             history = self.agent.state.data.setdefault("restart_history", {})
             history[service.service_id] = {
@@ -274,6 +318,49 @@ class AgentCommandServer:
                 "stderr": result["stderr"],
             }
             self.agent.state.save()
+        self._send_control_result_or_spool(result_payload)
+
+    def _control_result_payload(
+        self,
+        execution_id: str,
+        service: Any,
+        payload: dict[str, Any],
+        operation: str,
+        command: list[str],
+        result: dict[str, Any],
+        postcheck: dict[str, Any],
+        observed_at: datetime,
+        *,
+        status: str,
+        successful: bool,
+        phase: str,
+    ) -> dict[str, Any]:
+        return {
+            "agent_id": self.agent.settings.agent_id,
+            "execution_id": execution_id,
+            "action_execution_id": payload.get("action_execution_id"),
+            "incident_id": payload.get("incident_id"),
+            "service_id": service.service_id,
+            "operation": operation,
+            "timestamp": observed_at.isoformat().replace("+00:00", "Z"),
+            "accepted": True,
+            "successful": successful,
+            "status": status,
+            "command": command,
+            "return_code": result.get("return_code"),
+            "stdout": result.get("stdout") or "",
+            "stderr": result.get("stderr") or "",
+            "postcheck": postcheck,
+            "metadata": {
+                "approved_by": payload.get("approved_by"),
+                "requested_by": payload.get("requested_by"),
+                "reason": payload.get("reason"),
+                "agent_version": __version__,
+                "phase": phase,
+            },
+        }
+
+    def _send_control_result_or_spool(self, result_payload: dict[str, Any]) -> None:
         try:
             self.agent.client.control_result(result_payload)
         except Exception:
@@ -318,7 +405,24 @@ def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int
     return min(max(parsed, minimum), maximum)
 
 
-def _tail_service_log(service: Any, *, max_lines: int, max_bytes: int) -> dict[str, Any]:
+def _optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _tail_service_log(
+    service: Any,
+    *,
+    max_lines: int,
+    max_bytes: int,
+    cursor: int | None = None,
+    newest_first: bool = True,
+) -> dict[str, Any]:
     generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     path_value = str(getattr(service, "log_path", None) or "").strip()
     if not path_value:
@@ -344,7 +448,20 @@ def _tail_service_log(service: Any, *, max_lines: int, max_bytes: int) -> dict[s
         }
     try:
         stat = log_path.stat()
-        start = max(stat.st_size - max_bytes, 0)
+        rotated = cursor is not None and stat.st_size < cursor
+        if cursor is None or rotated:
+            start = max(stat.st_size - max_bytes, 0)
+            tail_mode = "snapshot_rotated" if rotated else "snapshot"
+            drop_partial_line = start > 0
+        else:
+            start = min(cursor, stat.st_size)
+            if stat.st_size - start > max_bytes:
+                start = max(stat.st_size - max_bytes, 0)
+                tail_mode = "delta_truncated"
+                drop_partial_line = start > 0
+            else:
+                tail_mode = "delta"
+                drop_partial_line = False
         with log_path.open("rb") as handle:
             handle.seek(start)
             raw = handle.read(max_bytes)
@@ -362,10 +479,21 @@ def _tail_service_log(service: Any, *, max_lines: int, max_bytes: int) -> dict[s
 
     text = raw.decode("utf-8", errors="replace")
     raw_lines = text.splitlines()
-    if start > 0 and raw_lines:
+    if drop_partial_line and raw_lines:
         raw_lines = raw_lines[1:]
     selected = raw_lines[-max_lines:]
     first_line_index = max(len(raw_lines) - len(selected), 0)
+    line_payload = [
+        {
+            "index": first_line_index + index + 1,
+            "message": _strip_ansi(line),
+            "raw": line,
+            **_log_line_metadata(line),
+        }
+        for index, line in enumerate(selected)
+    ]
+    if newest_first:
+        line_payload = list(reversed(line_payload))
     return {
         "service_id": service.service_id,
         "service_name": service.service_name,
@@ -374,18 +502,15 @@ def _tail_service_log(service: Any, *, max_lines: int, max_bytes: int) -> dict[s
         "log_path": path_value,
         "owner": file_owner_summary(path_value),
         "file_size": stat.st_size,
+        "cursor": stat.st_size,
+        "tail_mode": tail_mode,
         "bytes_read": len(raw),
         "max_lines": max_lines,
+        "new_line_count": len(selected),
+        "newest_first": newest_first,
         "truncated": start > 0 or len(raw_lines) > len(selected),
-        "lines": [
-            {
-                "index": first_line_index + index + 1,
-                "message": _strip_ansi(line),
-                "raw": line,
-                **_log_line_metadata(line),
-            }
-            for index, line in enumerate(selected)
-        ],
+        "rotated": rotated,
+        "lines": line_payload,
     }
 
 
@@ -477,11 +602,13 @@ def _run_control_command(
     contract: dict[str, Any],
     operation: str,
     command: list[str],
+    *,
+    progress_callback: Callable[[], None] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     if command[:1] == [BUILTIN_SPRING_BOOT_CONTROL]:
         return _run_spring_boot_control(service, contract, operation), command
 
-    result = _run_command(command, timeout_seconds=90)
+    result = _run_command(command, timeout_seconds=180, progress_callback=progress_callback)
     if result["return_code"] == 127 and _spring_boot_control_spec(service, contract):
         LOGGER.warning(
             "control command failed with 127 for %s %s; falling back to built-in Spring Boot jar control: %s",
@@ -707,9 +834,15 @@ def _post_control_check(service: Any, operation: str, command_result: dict[str, 
     }
 
 
-def _wait_for_post_control_check(service: Any, operation: str, command_result: dict[str, Any]) -> dict[str, Any]:
+def _wait_for_post_control_check(
+    service: Any,
+    operation: str,
+    command_result: dict[str, Any],
+    *,
+    initial_postcheck: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     started = time.monotonic()
-    postcheck = _post_control_check(service, operation, command_result)
+    postcheck = initial_postcheck or _post_control_check(service, operation, command_result)
     if command_result["return_code"] != 0 or postcheck.get("success"):
         postcheck["verification_elapsed_seconds"] = round(time.monotonic() - started, 3)
         postcheck["verification_timeout_seconds"] = 0
@@ -730,11 +863,28 @@ def _wait_for_post_control_check(service: Any, operation: str, command_result: d
     return postcheck
 
 
+def _postcheck_has_operator_visible_state(operation: str, postcheck: dict[str, Any]) -> bool:
+    if operation == "stop":
+        return postcheck.get("expected_state") == "stopped" and int(postcheck.get("process_count") or 0) == 0
+    return int(postcheck.get("process_count") or 0) > 0
+
+
+def _postcheck_is_transitional(operation: str, postcheck: dict[str, Any], command_result: dict[str, Any]) -> bool:
+    if command_result.get("return_code") != 0:
+        return False
+    if operation not in {"start", "restart"}:
+        return False
+    return (
+        int(postcheck.get("process_count") or 0) > 0
+        and postcheck.get("status") in {"tcp_not_ready", "process_not_running"}
+    )
+
+
 def _control_postcheck_timeout_seconds(service: Any, operation: str) -> int:
     configured = max(int(getattr(service, "restart_settle_seconds", 5) or 5), 1)
     if operation == "stop":
         return min(max(configured, 3), 8)
-    return min(max(configured, 5), 30)
+    return min(max(configured, 60), 180)
 
 
 def _service_readiness_check(service: Any) -> dict[str, Any]:
@@ -881,24 +1031,44 @@ def _diagnostic_command_result(command_id: str, command: list[str], started_at: 
     }
 
 
-def _run_command(command: list[str], *, timeout_seconds: int) -> dict[str, Any]:
+def _run_command(
+    command: list[str],
+    *,
+    timeout_seconds: int,
+    progress_callback: Callable[[], None] | None = None,
+) -> dict[str, Any]:
     safe_command = [part for part in command if part]
     if not safe_command:
         return {"return_code": 127, "stdout": "", "stderr": "empty command"}
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             safe_command,
-            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout_seconds,
-            check=False,
             shell=False,
         )
-        return {
-            "return_code": completed.returncode,
-            "stdout": _truncate(completed.stdout),
-            "stderr": _truncate(completed.stderr),
-        }
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                stdout, stderr = process.communicate(timeout=0.75)
+                return {
+                    "return_code": process.returncode,
+                    "stdout": _truncate(stdout or ""),
+                    "stderr": _truncate(stderr or ""),
+                }
+            except subprocess.TimeoutExpired:
+                if progress_callback:
+                    progress_callback()
+                if time.monotonic() >= deadline:
+                    process.kill()
+                    stdout, stderr = process.communicate(timeout=5)
+                    return {
+                        "return_code": 124,
+                        "stdout": _truncate(stdout or ""),
+                        "stderr": _truncate(stderr or "command timed out"),
+                    }
     except subprocess.TimeoutExpired as exc:
         return {
             "return_code": 124,
