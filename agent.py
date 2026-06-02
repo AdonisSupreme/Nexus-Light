@@ -274,12 +274,35 @@ class NexusLightAgent:
                     "bounded_log_signatures",
                     "service_profile_analysis",
                     "local_healthcheck",
+                    "bounded_live_log_tail",
                     "diagnostics_executor",
                     "guarded_restart_executor",
                 ],
                 "metadata": {
                     "collector_mode": pressure["collector_mode"],
                     "command_server_enabled": self.settings.command_server.enabled,
+                    "command_server": {
+                        "enabled": self.settings.command_server.enabled,
+                        "bind_host": self.settings.command_server.bind_host,
+                        "port": self.settings.command_server.port,
+                        "public_base_url": self.settings.command_server.public_base_url,
+                    },
+                    "host": host,
+                    "resource_pressure": pressure,
+                    "watched_services": [
+                        {
+                            "service_id": watched.service_id,
+                            "service_name": watched.service_name,
+                            "environment": watched.environment,
+                            "instance_id": watched.instance_id,
+                            "expected_running": watched.expected_running,
+                            "process_match": watched.process_match,
+                            "log_path": watched.log_path,
+                            "systemd_unit": watched.systemd_unit,
+                            "tags": watched.tags,
+                        }
+                        for watched in self.settings.enabled_services
+                    ],
                 },
             }
             try:

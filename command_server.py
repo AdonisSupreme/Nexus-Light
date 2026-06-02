@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 from . import __version__
+from .logs import file_owner_summary
 from .procfs import enrich_cpu_percent, find_processes
 from .system import host_snapshot, resource_pressure
 
@@ -74,6 +75,10 @@ class AgentCommandServer:
                     return
                 if self.path.rstrip("/") == "/control":
                     status, response = server.request_control(payload)
+                    server._write_json(self, status, response)
+                    return
+                if self.path.rstrip("/") == "/logs/tail":
+                    status, response = server.request_log_tail(payload)
                     server._write_json(self, status, response)
                     return
                 server._write_json(self, 404, {"error": "not_found"})
@@ -152,6 +157,28 @@ class AgentCommandServer:
         )
         thread.start()
         return 202, {"accepted": True, "execution_id": execution_id, "service_id": service_id, "operation": operation}
+
+    def request_log_tail(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        service_id = str(payload.get("service_id") or "")
+        service = self.agent.get_service(service_id)
+        if not service:
+            return 404, {"error": f"unknown service {service_id}"}
+        contract = self.agent.get_cached_remote_contract(service_id)
+        if not contract:
+            LOGGER.warning("log tail rejected for %s: no cached Nexus service contract", service_id)
+            return 503, {
+                "available": False,
+                "reason": "No cached Nexus service contract is available yet.",
+                "service_id": service_id,
+                "lines": [],
+            }
+        allowed, reason = _diagnostics_allowed(contract)
+        if not allowed:
+            return 403, {"available": False, "reason": reason, "service_id": service_id, "lines": []}
+
+        max_lines = _bounded_int(payload.get("max_lines"), default=120, minimum=20, maximum=300)
+        max_bytes = _bounded_int(payload.get("max_bytes"), default=196_608, minimum=8_192, maximum=262_144)
+        return 200, _tail_service_log(service, max_lines=max_lines, max_bytes=max_bytes)
 
     def _run_diagnostics_background(self, request_id: str, service: Any, payload: dict[str, Any]) -> None:
         commands = [command for command in (payload.get("commands") or []) if isinstance(command, dict)]
@@ -281,6 +308,102 @@ class AgentCommandServer:
         handler.send_header("Content-Length", str(len(body)))
         handler.end_headers()
         handler.wfile.write(body)
+
+
+def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return min(max(parsed, minimum), maximum)
+
+
+def _tail_service_log(service: Any, *, max_lines: int, max_bytes: int) -> dict[str, Any]:
+    generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    path_value = str(getattr(service, "log_path", None) or "").strip()
+    if not path_value:
+        return {
+            "service_id": service.service_id,
+            "service_name": service.service_name,
+            "generated_at": generated_at,
+            "available": False,
+            "reason": "No log_path is configured for this service.",
+            "lines": [],
+        }
+    log_path = Path(path_value)
+    if not log_path.exists():
+        return {
+            "service_id": service.service_id,
+            "service_name": service.service_name,
+            "generated_at": generated_at,
+            "available": False,
+            "reason": f"Log path does not exist: {path_value}",
+            "log_path": path_value,
+            "owner": file_owner_summary(path_value),
+            "lines": [],
+        }
+    try:
+        stat = log_path.stat()
+        start = max(stat.st_size - max_bytes, 0)
+        with log_path.open("rb") as handle:
+            handle.seek(start)
+            raw = handle.read(max_bytes)
+    except OSError as exc:
+        return {
+            "service_id": service.service_id,
+            "service_name": service.service_name,
+            "generated_at": generated_at,
+            "available": False,
+            "reason": f"Log tail read failed: {exc}",
+            "log_path": path_value,
+            "owner": file_owner_summary(path_value),
+            "lines": [],
+        }
+
+    text = raw.decode("utf-8", errors="replace")
+    raw_lines = text.splitlines()
+    if start > 0 and raw_lines:
+        raw_lines = raw_lines[1:]
+    selected = raw_lines[-max_lines:]
+    first_line_index = max(len(raw_lines) - len(selected), 0)
+    return {
+        "service_id": service.service_id,
+        "service_name": service.service_name,
+        "generated_at": generated_at,
+        "available": True,
+        "log_path": path_value,
+        "owner": file_owner_summary(path_value),
+        "file_size": stat.st_size,
+        "bytes_read": len(raw),
+        "max_lines": max_lines,
+        "truncated": start > 0 or len(raw_lines) > len(selected),
+        "lines": [
+            {
+                "index": first_line_index + index + 1,
+                "message": _strip_ansi(line),
+                "raw": line,
+                **_log_line_metadata(line),
+            }
+            for index, line in enumerate(selected)
+        ],
+    }
+
+
+def _strip_ansi(value: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", value)
+
+
+def _log_line_metadata(line: str) -> dict[str, Any]:
+    clean = _strip_ansi(line)
+    timestamp_match = re.search(r"\[?(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d{3,6})?)\]?", clean)
+    level_match = re.search(r"\b(ERROR|WARN|WARNING|INFO|DEBUG|TRACE|FATAL)\b", clean)
+    level = level_match.group(1).upper() if level_match else None
+    severity = "CRITICAL" if level in {"ERROR", "FATAL"} else "WARN" if level in {"WARN", "WARNING"} else "INFO" if level else None
+    return {
+        "timestamp": timestamp_match.group(1).replace(",", ".") if timestamp_match else None,
+        "level": level,
+        "severity": severity,
+    }
 
 
 def _diagnostics_allowed(contract: dict[str, Any]) -> tuple[bool, str]:
