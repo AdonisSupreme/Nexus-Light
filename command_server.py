@@ -805,6 +805,28 @@ def _post_control_check(
             "required": bool(_service_readiness_port(service, contract=contract)),
             "ready": False,
         }
+        launch_context = _spring_launch_context_check(service, processes, contract=contract) if process_count > 0 else {
+            "required": bool(_spring_boot_control_spec(service, contract)),
+            "verified": False,
+            "reason": "No matching process is visible yet.",
+        }
+        if launch_context.get("required") and launch_context.get("mismatch"):
+            expected_cwd = launch_context.get("expected_cwd")
+            actual_cwds = ", ".join(str(item) for item in launch_context.get("actual_cwds") or ["unknown"])
+            return {
+                "success": False,
+                "status": "launch_context_mismatch",
+                "message": (
+                    f"Post-{operation} verification failed: matching service process is running from {actual_cwds}, "
+                    f"but Nexus expects the manual ATE launch directory {expected_cwd}."
+                ),
+                "expected_state": "running",
+                "process_match": service.process_match,
+                "process_count": process_count,
+                "processes": processes[:5],
+                "readiness": readiness,
+                "launch_context": launch_context,
+            }
         success = process_count > 0 and (not readiness.get("required") or bool(readiness.get("ready")))
         if process_count > 0 and readiness.get("required") and not readiness.get("ready"):
             message = (
@@ -829,6 +851,7 @@ def _post_control_check(
             "process_count": process_count,
             "processes": processes[:5],
             "readiness": readiness,
+            "launch_context": launch_context,
         }
 
     if service.systemd_unit:
@@ -884,6 +907,39 @@ def _wait_for_post_control_check(
     postcheck["verification_elapsed_seconds"] = round(time.monotonic() - started, 3)
     postcheck["verification_timeout_seconds"] = timeout_seconds
     return postcheck
+
+
+def _spring_launch_context_check(
+    service: Any,
+    processes: list[dict[str, Any]],
+    *,
+    contract: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    spec = _spring_boot_control_spec(service, contract)
+    if not spec:
+        return {"required": False, "verified": False, "reason": "No Spring Boot launch metadata is configured."}
+    expected_cwd = _normalize_control_path(spec.get("working_dir") or "/srv")
+    actual_cwds = [
+        _normalize_control_path(str(process.get("cwd") or ""))
+        for process in processes
+        if process.get("cwd")
+    ]
+    mismatches = sorted({cwd for cwd in actual_cwds if cwd and cwd != expected_cwd})
+    return {
+        "required": True,
+        "verified": bool(actual_cwds) and not mismatches,
+        "mismatch": bool(mismatches),
+        "expected_cwd": expected_cwd,
+        "actual_cwds": actual_cwds,
+        "unavailable": len(actual_cwds) < len(processes),
+    }
+
+
+def _normalize_control_path(value: str) -> str:
+    normalized = str(value or "").strip().replace("\\", "/")
+    while len(normalized) > 1 and normalized.endswith("/"):
+        normalized = normalized[:-1]
+    return normalized
 
 
 def _postcheck_has_operator_visible_state(operation: str, postcheck: dict[str, Any]) -> bool:

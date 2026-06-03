@@ -75,6 +75,7 @@ def read_process_snapshot(pid: int, cmdline: str) -> dict[str, Any] | None:
     stime = int(stat_parts[14])
     rss_pages = int(stat_parts[23]) if len(stat_parts) > 23 else 0
     status = _parse_status(status_text)
+    cwd = _read_link(proc / "cwd")
     return {
         "pid": pid,
         "state": stat_parts[2],
@@ -83,6 +84,8 @@ def read_process_snapshot(pid: int, cmdline: str) -> dict[str, Any] | None:
         "vm_size_mb": _kb_to_mb(status.get("VmSize")),
         "vm_rss_mb": _kb_to_mb(status.get("VmRSS")),
         "cpu_seconds": round((utime + stime) / CLK_TCK, 2),
+        "uid": _first_status_value(status.get("Uid")),
+        "cwd": cwd,
         "cmdline": cmdline[:500],
     }
 
@@ -105,6 +108,22 @@ def _parse_status(status_text: str) -> dict[str, str]:
         key, value = line.split(":", 1)
         payload[key.strip()] = value.strip()
     return payload
+
+
+def _first_status_value(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        return int(value.split()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def _read_link(path: Path) -> str | None:
+    try:
+        return str(path.resolve(strict=True))
+    except OSError:
+        return None
 
 
 def _kb_to_mb(value: str | None) -> float | None:
