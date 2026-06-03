@@ -249,7 +249,7 @@ class AgentCommandServer:
 
         def observe_progress() -> None:
             probe_result = {"return_code": 0, "stdout": "", "stderr": ""}
-            postcheck = _post_control_check(service, operation, probe_result)
+            postcheck = _post_control_check(service, operation, probe_result, contract=contract)
             if _postcheck_has_operator_visible_state(operation, postcheck):
                 emit_progress(
                     postcheck,
@@ -264,14 +264,20 @@ class AgentCommandServer:
             command,
             progress_callback=observe_progress,
         )
-        immediate_postcheck = _post_control_check(service, operation, result)
+        immediate_postcheck = _post_control_check(service, operation, result, contract=contract)
         if not progress_sent and _postcheck_is_transitional(operation, immediate_postcheck, result):
             emit_progress(immediate_postcheck, result, status="starting")
 
         postcheck = (
             immediate_postcheck
             if result["return_code"] != 0 or immediate_postcheck.get("success")
-            else _wait_for_post_control_check(service, operation, result, initial_postcheck=immediate_postcheck)
+            else _wait_for_post_control_check(
+                service,
+                operation,
+                result,
+                initial_postcheck=immediate_postcheck,
+                contract=contract,
+            )
         )
         verified = bool(postcheck.get("success"))
         history_status = "verified" if verified else ("failed" if result["return_code"] != 0 else "verification_failed")
@@ -723,7 +729,7 @@ def _start_spring_boot_service(spec: dict[str, str]) -> dict[str, Any]:
         return {"return_code": 127, "stdout": [], "stderr": [f"Spring config path does not exist: {config}"]}
     working_dir = Path(spec.get("working_dir") or "/srv")
     if not working_dir.exists():
-        working_dir = jar.parent
+        return {"return_code": 127, "stdout": [], "stderr": [f"Working directory does not exist: {working_dir}"]}
     command = [
         "nohup",
         spec["java_bin"],
@@ -742,10 +748,23 @@ def _start_spring_boot_service(spec: dict[str, str]) -> dict[str, Any]:
         )
     except OSError as exc:
         return {"return_code": 127, "stdout": [], "stderr": [str(exc)]}
-    return {"return_code": 0, "stdout": [f"Started {spec['process_match']} with pid {process.pid}."], "stderr": []}
+    return {
+        "return_code": 0,
+        "stdout": [
+            f"Started {spec['process_match']} with pid {process.pid}.",
+            f"Launch cwd={working_dir} config={config}",
+        ],
+        "stderr": [],
+    }
 
 
-def _post_control_check(service: Any, operation: str, command_result: dict[str, Any]) -> dict[str, Any]:
+def _post_control_check(
+    service: Any,
+    operation: str,
+    command_result: dict[str, Any],
+    *,
+    contract: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if command_result["return_code"] != 0:
         stderr = str(command_result.get("stderr") or "").strip()
         stdout = str(command_result.get("stdout") or "").strip()
@@ -782,7 +801,10 @@ def _post_control_check(service: Any, operation: str, command_result: dict[str, 
                 "process_count": process_count,
                 "processes": processes[:5],
             }
-        readiness = _service_readiness_check(service) if process_count > 0 else {"required": False, "ready": False}
+        readiness = _service_readiness_check(service, contract=contract) if process_count > 0 else {
+            "required": bool(_service_readiness_port(service, contract=contract)),
+            "ready": False,
+        }
         success = process_count > 0 and (not readiness.get("required") or bool(readiness.get("ready")))
         if process_count > 0 and readiness.get("required") and not readiness.get("ready"):
             message = (
@@ -840,9 +862,10 @@ def _wait_for_post_control_check(
     command_result: dict[str, Any],
     *,
     initial_postcheck: dict[str, Any] | None = None,
+    contract: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     started = time.monotonic()
-    postcheck = initial_postcheck or _post_control_check(service, operation, command_result)
+    postcheck = initial_postcheck or _post_control_check(service, operation, command_result, contract=contract)
     if command_result["return_code"] != 0 or postcheck.get("success"):
         postcheck["verification_elapsed_seconds"] = round(time.monotonic() - started, 3)
         postcheck["verification_timeout_seconds"] = 0
@@ -852,7 +875,7 @@ def _wait_for_post_control_check(
     deadline = started + timeout_seconds
     while time.monotonic() < deadline:
         time.sleep(0.5)
-        postcheck = _post_control_check(service, operation, command_result)
+        postcheck = _post_control_check(service, operation, command_result, contract=contract)
         if postcheck.get("success"):
             postcheck["verification_elapsed_seconds"] = round(time.monotonic() - started, 3)
             postcheck["verification_timeout_seconds"] = timeout_seconds
@@ -887,11 +910,11 @@ def _control_postcheck_timeout_seconds(service: Any, operation: str) -> int:
     return min(max(configured, 60), 180)
 
 
-def _service_readiness_check(service: Any) -> dict[str, Any]:
-    port = _service_readiness_port(service)
+def _service_readiness_check(service: Any, *, contract: dict[str, Any] | None = None) -> dict[str, Any]:
+    port = _service_readiness_port(service, contract=contract)
     if not port:
         return {"required": False, "ready": False, "reason": "No readiness port or healthcheck port is configured or discoverable."}
-    hosts = _readiness_hosts(service)
+    hosts = _readiness_hosts(service, contract=contract)
     started = time.monotonic()
     errors: list[str] = []
     for host in hosts:
@@ -916,30 +939,48 @@ def _service_readiness_check(service: Any) -> dict[str, Any]:
     }
 
 
-def _readiness_hosts(service: Any) -> list[str]:
-    configured = str(getattr(service, "readiness_host", None) or "").strip()
+def _readiness_hosts(service: Any, *, contract: dict[str, Any] | None = None) -> list[str]:
+    metadata = _contract_service_metadata(contract)
+    endpoint_config = _contract_endpoint_config(contract)
+    configured = str(getattr(service, "readiness_host", None) or metadata.get("readiness_host") or "").strip()
     health_host = ""
-    if getattr(service, "healthcheck_url", None):
+    healthcheck_url = getattr(service, "healthcheck_url", None) or endpoint_config.get("healthcheck_url")
+    if healthcheck_url:
         try:
-            health_host = urlparse(str(service.healthcheck_url)).hostname or ""
+            health_host = urlparse(str(healthcheck_url)).hostname or ""
         except ValueError:
             health_host = ""
     candidates = [configured, health_host, "127.0.0.1", "localhost"]
     return list(dict.fromkeys([item for item in candidates if item]))
 
 
-def _service_readiness_port(service: Any) -> int | None:
-    configured = getattr(service, "readiness_port", None)
+def _service_readiness_port(service: Any, *, contract: dict[str, Any] | None = None) -> int | None:
+    metadata = _contract_service_metadata(contract)
+    endpoint_config = _contract_endpoint_config(contract)
+    configured = getattr(service, "readiness_port", None) or metadata.get("readiness_port") or metadata.get("server_port")
     if configured:
         return int(configured)
-    if getattr(service, "healthcheck_url", None):
+    healthcheck_url = getattr(service, "healthcheck_url", None) or endpoint_config.get("healthcheck_url")
+    if healthcheck_url:
         try:
-            parsed = urlparse(str(service.healthcheck_url))
+            parsed = urlparse(str(healthcheck_url))
         except ValueError:
             parsed = None
         if parsed and parsed.port:
             return int(parsed.port)
-    return _discover_spring_server_port(getattr(service, "config_path", None))
+    return _discover_spring_server_port(getattr(service, "config_path", None) or metadata.get("config_path"))
+
+
+def _contract_service_metadata(contract: dict[str, Any] | None) -> dict[str, Any]:
+    service = (contract or {}).get("service") or {}
+    metadata = service.get("metadata") if isinstance(service, dict) else {}
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _contract_endpoint_config(contract: dict[str, Any] | None) -> dict[str, Any]:
+    service = (contract or {}).get("service") or {}
+    endpoint_config = service.get("endpoint_config") if isinstance(service, dict) else {}
+    return endpoint_config if isinstance(endpoint_config, dict) else {}
 
 
 def _discover_spring_server_port(config_path: str | None) -> int | None:
@@ -970,11 +1011,12 @@ def _execute_diagnostic_command(agent: Any, service: Any, command: dict[str, Any
     command_id = command.get("command_id")
     started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     if command_id == "runtime_status":
+        contract = agent.get_cached_remote_contract(service.service_id)
         return {
             "command_id": command_id,
             "status": "COMPLETED",
             "started_at": started_at,
-            "output": _runtime_diagnostic_output(agent, service),
+            "output": _runtime_diagnostic_output(agent, service, contract=contract),
         }
     if command_id == "systemd_status":
         return _diagnostic_command_result(command_id, ["systemctl", "status", service.systemd_unit or "", "--no-pager"], started_at, skip=not service.systemd_unit)
@@ -991,7 +1033,7 @@ def _execute_diagnostic_command(agent: Any, service: Any, command: dict[str, Any
     return {"command_id": command_id, "status": "SKIPPED", "started_at": started_at, "reason": "Command is not in the agent allowlist."}
 
 
-def _runtime_diagnostic_output(agent: Any, service: Any) -> dict[str, Any]:
+def _runtime_diagnostic_output(agent: Any, service: Any, *, contract: dict[str, Any] | None = None) -> dict[str, Any]:
     host = host_snapshot(service.log_path)
     pressure = resource_pressure(
         host,
@@ -1001,7 +1043,10 @@ def _runtime_diagnostic_output(agent: Any, service: Any) -> dict[str, Any]:
     processes = enrich_cpu_percent(find_processes(service.process_match), agent.state.data)
     process_count = len(processes)
     runtime_state = "running" if process_count else "stopped" if service.expected_running else "not_expected"
-    readiness = _service_readiness_check(service) if process_count else {"required": bool(_service_readiness_port(service)), "ready": False}
+    readiness = _service_readiness_check(service, contract=contract) if process_count else {
+        "required": bool(_service_readiness_port(service, contract=contract)),
+        "ready": False,
+    }
     return {
         "service_id": service.service_id,
         "service_name": service.service_name,

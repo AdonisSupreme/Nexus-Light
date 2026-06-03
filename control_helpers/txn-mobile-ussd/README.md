@@ -19,3 +19,26 @@ ashumba ALL=(root) NOPASSWD: /opt/sentinel-nexus-control/txn-mobile-ussd/start.s
 ```
 
 The agent config should call these exact scripts via `sudo -n`, not arbitrary shell commands.
+
+Required service control fields in `/etc/nexus-light/txn-mobile-ussd.json`:
+
+```json
+"jar_path": "/srv/afc/txn-mobile/txn-mobile-ussd/lib/txn-mobile-ussd-0.0.1-SNAPSHOT.jar",
+"config_path": "/srv/afc/txn-mobile/txn-mobile-ussd/etc/application.yml",
+"java_bin": "java",
+"working_dir": "/srv",
+"readiness_host": "127.0.0.1",
+"readiness_port": 8091,
+"start_command": ["sudo", "-n", "/opt/sentinel-nexus-control/txn-mobile-ussd/start.sh"],
+"stop_command": ["sudo", "-n", "/opt/sentinel-nexus-control/txn-mobile-ussd/stop.sh"],
+"restart_command": ["sudo", "-n", "/opt/sentinel-nexus-control/txn-mobile-ussd/restart.sh"],
+"restart_settle_seconds": 90
+```
+
+The ATE manual script starts USSD from `/srv` using:
+
+```text
+nohup java -jar /srv/afc/txn-mobile/txn-mobile-ussd/lib/txn-mobile-ussd-0.0.1-SNAPSHOT.jar --spring.config.location=/srv/afc/txn-mobile/txn-mobile-ussd/etc/application.yml &
+```
+
+The Nexus helper intentionally mirrors that launch directory. Do not change it to the jar `lib` directory; logs from ATE show that this changes the runtime shape.
