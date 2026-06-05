@@ -26,6 +26,10 @@ MAX_OUTPUT_CHARS = 6000
 RESTART_BLOCKED_TYPES = {"db", "database", "cache", "queue", "auth", "infra"}
 RESTART_CAPABLE_TYPES = {"app", "worker", "gateway", "channel", "channel_adapter", "integration"}
 BUILTIN_SPRING_BOOT_CONTROL = "__nexus_builtin_spring_boot_jar__"
+LOG_EVENT_START_RE = re.compile(
+    r"^\s*\[?\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d{3,6})?\]?\s+"
+    r"(?:ERROR|WARN|WARNING|INFO|DEBUG|TRACE|FATAL)\b"
+)
 LOGGER = logging.getLogger("sentinel.nexus.light_agent")
 
 
@@ -487,19 +491,10 @@ def _tail_service_log(
     raw_lines = text.splitlines()
     if drop_partial_line and raw_lines:
         raw_lines = raw_lines[1:]
-    selected = raw_lines[-max_lines:]
-    first_line_index = max(len(raw_lines) - len(selected), 0)
-    line_payload = [
-        {
-            "index": first_line_index + index + 1,
-            "message": _strip_ansi(line),
-            "raw": line,
-            **_log_line_metadata(line),
-        }
-        for index, line in enumerate(selected)
-    ]
+    event_payload = _group_log_events(raw_lines)
+    selected = event_payload[-max_lines:]
     if newest_first:
-        line_payload = list(reversed(line_payload))
+        selected = list(reversed(selected))
     return {
         "service_id": service.service_id,
         "service_name": service.service_name,
@@ -513,11 +508,60 @@ def _tail_service_log(
         "bytes_read": len(raw),
         "max_lines": max_lines,
         "new_line_count": len(selected),
+        "physical_line_count": len(raw_lines),
+        "event_count": len(event_payload),
+        "line_grouping": "timestamp_event",
         "newest_first": newest_first,
-        "truncated": start > 0 or len(raw_lines) > len(selected),
+        "truncated": start > 0 or len(event_payload) > len(selected),
         "rotated": rotated,
-        "lines": line_payload,
+        "lines": selected,
     }
+
+
+def _group_log_events(raw_lines: list[str]) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    current_lines: list[str] = []
+    current_start_index = 0
+
+    def flush() -> None:
+        if not current_lines:
+            return
+        raw_message = "\n".join(current_lines)
+        clean_lines = [_strip_ansi(line) for line in current_lines]
+        clean_message = "\n".join(clean_lines)
+        header = clean_lines[0] if clean_lines else ""
+        events.append(
+            {
+                "index": current_start_index + 1,
+                "message": clean_message,
+                "raw": raw_message,
+                "header": header,
+                "body": "\n".join(clean_lines[1:]),
+                "physical_line_count": len(current_lines),
+                "continuation_count": max(len(current_lines) - 1, 0),
+                **_log_line_metadata(header or clean_message),
+            }
+        )
+
+    for index, line in enumerate(raw_lines):
+        clean = _strip_ansi(line)
+        if _is_log_event_start(clean):
+            flush()
+            current_lines = [line]
+            current_start_index = index
+            continue
+        if current_lines:
+            current_lines.append(line)
+        elif line.strip():
+            current_lines = [line]
+            current_start_index = index
+
+    flush()
+    return events
+
+
+def _is_log_event_start(line: str) -> bool:
+    return bool(LOG_EVENT_START_RE.match(line))
 
 
 def _strip_ansi(value: str) -> str:
