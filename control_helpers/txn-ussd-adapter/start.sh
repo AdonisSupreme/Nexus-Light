@@ -1,24 +1,50 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SERVICE_NAME="txn-mobile-ussd"
-PROCESS_MATCH="txn-mobile-ussd-0.0.1-SNAPSHOT.jar"
-JAR_PATH="/srv/afc/txn-mobile/txn-mobile-ussd/lib/txn-mobile-ussd-0.0.1-SNAPSHOT.jar"
-CONFIG_PATH="/srv/afc/txn-mobile/txn-mobile-ussd/etc/application.yml"
-LOG_PATH="/srv/log/ate/txn-mobile/txn-mobile-ussd/txn-mobile-ussd-human.log"
+SERVICE_NAME="txn-ussd-adapter"
+PROCESS_MATCH="txn-ussd-adapter-0.0.1-SNAPSHOT.jar"
+JAR_PATH="/srv/afc/txn-mobile/txn-ussd-adapter/lib/txn-ussd-adapter-0.0.1-SNAPSHOT.jar"
+CONFIG_PATH="/srv/afc/txn-mobile/txn-ussd-adapter/etc/application.yml"
+LOG_PATH="/srv/log/ate/txn-mobile/txn-ussd-adapter/txn-ussd-adapter-human.log"
 WORKING_DIR="/srv"
 NOHUP_OUT="$WORKING_DIR/nohup.out"
 JAVA_BIN="${JAVA_BIN:-java}"
 READINESS_HOST="127.0.0.1"
-READINESS_PORT="8091"
+READINESS_PORT="${READINESS_PORT:-}"
 SYSTEMD_UNIT="sentinel-nexus-${SERVICE_NAME}"
 
 matching_pids() {
   pgrep -f "$PROCESS_MATCH" || true
 }
 
+discover_readiness_port() {
+  if [[ -n "$READINESS_PORT" ]]; then
+    echo "$READINESS_PORT"
+    return 0
+  fi
+  [[ -r "$CONFIG_PATH" ]] || return 0
+  awk '
+    /^[[:space:]]*server:/ { in_server=1; next }
+    /^[^[:space:]]/ { in_server=0 }
+    in_server && /^[[:space:]]*port:[[:space:]]*[0-9]+/ {
+      gsub(/[^0-9]/, "", $0)
+      print $0
+      exit
+    }
+  ' "$CONFIG_PATH"
+}
+
 readiness_open() {
-  timeout 1 bash -c ":</dev/tcp/${READINESS_HOST}/${READINESS_PORT}" >/dev/null 2>&1
+  local port
+  port="$(discover_readiness_port)"
+  [[ -z "$port" ]] && return 0
+  timeout 1 bash -c ":</dev/tcp/${READINESS_HOST}/${port}" >/dev/null 2>&1
+}
+
+readiness_label() {
+  local port
+  port="$(discover_readiness_port)"
+  [[ -z "$port" ]] && echo "readiness port not declared in $CONFIG_PATH" || echo "${READINESS_HOST}:${port}"
 }
 
 verify_launch_context() {
@@ -76,25 +102,19 @@ launch_service() {
   cd "$WORKING_DIR"
   echo "Starting $SERVICE_NAME from $(pwd -P) with config $CONFIG_PATH"
 
-  if command -v systemd-run >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1; then
-    systemctl reset-failed "${SYSTEMD_UNIT}.service" >/dev/null 2>&1 || true
-    systemd-run \
-      --unit="$SYSTEMD_UNIT" \
-      --collect \
-      --quiet \
-      --property=Restart=no \
-      /bin/bash -lc "cd '$WORKING_DIR' && exec '$JAVA_BIN' -jar '$JAR_PATH' --spring.config.location='$CONFIG_PATH' >>'$NOHUP_OUT' 2>&1"
-    echo "$SERVICE_NAME launch delegated to systemd transient unit ${SYSTEMD_UNIT}.service"
-    return 0
-  fi
-
-  nohup "$JAVA_BIN" -jar "$JAR_PATH" --spring.config.location="$CONFIG_PATH" >>"$NOHUP_OUT" 2>&1 &
-  echo "$SERVICE_NAME launch delegated with nohup launcher_pid=$!"
+  systemctl reset-failed "${SYSTEMD_UNIT}.service" >/dev/null 2>&1 || true
+  systemd-run \
+    --unit="$SYSTEMD_UNIT" \
+    --collect \
+    --quiet \
+    --property=Restart=no \
+    /bin/bash -lc "cd '$WORKING_DIR' && exec '$JAVA_BIN' -jar '$JAR_PATH' --spring.config.location='$CONFIG_PATH' >>'$NOHUP_OUT' 2>&1"
+  echo "$SERVICE_NAME launch delegated to systemd transient unit ${SYSTEMD_UNIT}.service"
 }
 
 if pgrep -f "$PROCESS_MATCH" >/dev/null 2>&1; then
   if verify_launch_context && readiness_open; then
-    echo "$SERVICE_NAME already running from $WORKING_DIR and listening on ${READINESS_HOST}:${READINESS_PORT}: $(pgrep -f -d ' ' "$PROCESS_MATCH")"
+    echo "$SERVICE_NAME already running from $WORKING_DIR with $(readiness_label): $(pgrep -f -d ' ' "$PROCESS_MATCH")"
     exit 0
   fi
   echo "$SERVICE_NAME has a matching process but is not in the manual-good ready state; Nexus will replace it."

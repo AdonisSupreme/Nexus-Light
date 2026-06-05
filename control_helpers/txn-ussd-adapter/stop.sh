@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SERVICE_NAME="txn-mobile-ussd"
-PROCESS_MATCH="txn-mobile-ussd-0.0.1-SNAPSHOT.jar"
+SERVICE_NAME="txn-ussd-adapter"
+PROCESS_MATCH="txn-ussd-adapter-0.0.1-SNAPSHOT.jar"
 SYSTEMD_UNIT="sentinel-nexus-${SERVICE_NAME}"
 
 if command -v systemctl >/dev/null 2>&1; then

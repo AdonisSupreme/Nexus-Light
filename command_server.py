@@ -614,7 +614,11 @@ def _run_control_command(
     if command[:1] == [BUILTIN_SPRING_BOOT_CONTROL]:
         return _run_spring_boot_control(service, contract, operation), command
 
-    result = _run_command(command, timeout_seconds=180, progress_callback=progress_callback)
+    result = _run_command(
+        command,
+        timeout_seconds=_control_command_timeout_seconds(service, operation),
+        progress_callback=progress_callback,
+    )
     if result["return_code"] == 127 and _spring_boot_control_spec(service, contract):
         LOGGER.warning(
             "control command failed with 127 for %s %s; falling back to built-in Spring Boot jar control: %s",
@@ -963,7 +967,18 @@ def _control_postcheck_timeout_seconds(service: Any, operation: str) -> int:
     configured = max(int(getattr(service, "restart_settle_seconds", 5) or 5), 1)
     if operation == "stop":
         return min(max(configured, 3), 8)
-    return min(max(configured, 60), 180)
+    if operation == "start":
+        return min(max(configured, 10), 90)
+    return min(max(configured, 30), 180)
+
+
+def _control_command_timeout_seconds(service: Any, operation: str) -> int:
+    configured = max(int(getattr(service, "restart_settle_seconds", 5) or 5), 1)
+    if operation == "stop":
+        return min(max(configured + 5, 12), 30)
+    if operation == "start":
+        return min(max(configured + 10, 20), 60)
+    return min(max(configured + 20, 35), 90)
 
 
 def _service_readiness_check(service: Any, *, contract: dict[str, Any] | None = None) -> dict[str, Any]:

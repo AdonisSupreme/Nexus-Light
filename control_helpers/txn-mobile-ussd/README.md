@@ -32,7 +32,7 @@ Required service control fields in `/etc/nexus-light/txn-mobile-ussd.json`:
 "start_command": ["sudo", "-n", "/opt/sentinel-nexus-control/txn-mobile-ussd/start.sh"],
 "stop_command": ["sudo", "-n", "/opt/sentinel-nexus-control/txn-mobile-ussd/stop.sh"],
 "restart_command": ["sudo", "-n", "/opt/sentinel-nexus-control/txn-mobile-ussd/restart.sh"],
-"restart_settle_seconds": 90
+"restart_settle_seconds": 30
 ```
 
 The ATE manual script starts USSD from `/srv` using:
@@ -42,6 +42,8 @@ nohup java -jar /srv/afc/txn-mobile/txn-mobile-ussd/lib/txn-mobile-ussd-0.0.1-SN
 ```
 
 The Nexus helper intentionally mirrors that launch directory. Do not change it to the jar `lib` directory; logs from ATE show that this changes the runtime shape.
+
+When invoked by the light agent, `start.sh` delegates the Java process to the transient systemd unit `sentinel-nexus-txn-mobile-ussd.service`. This is deliberate. It keeps the USSD JVM out of the light-agent service cgroup, so the application does not inherit the agent's low CPU and memory limits. Manual starts from an SSH shell are not inside the light-agent cgroup, which is why a plain `nohup` can work manually while a Nexus-triggered plain `nohup` can produce a process that never opens port `8091`.
 
 Fast deploy or refresh on ATE:
 
@@ -60,6 +62,7 @@ sudo -n /opt/sentinel-nexus-control/txn-mobile-ussd/stop.sh
 sudo -n /opt/sentinel-nexus-control/txn-mobile-ussd/start.sh
 pid="$(pgrep -f 'txn-mobile-ussd-0.0.1-SNAPSHOT.jar' | head -n 1)"
 readlink -f "/proc/${pid}/cwd"
+systemctl status sentinel-nexus-txn-mobile-ussd.service --no-pager -l
 ss -ltnp | grep ':8091'
 tail -n 80 /srv/log/ate/txn-mobile/txn-mobile-ussd/txn-mobile-ussd-human.log
 ```
@@ -68,6 +71,7 @@ Expected validation:
 
 ```text
 /srv
+Active: active
 Tomcat started on port(s): 8091
 NotificationService - Poll Started
 ```
