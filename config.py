@@ -77,6 +77,7 @@ class ServiceWatch:
     start_command: list[str] = field(default_factory=list)
     stop_command: list[str] = field(default_factory=list)
     restart_command: list[str] = field(default_factory=list)
+    control_timeout_seconds: dict[str, int] = field(default_factory=dict)
     restart_settle_seconds: int = 5
     tags: list[str] = field(default_factory=list)
     analysis_profile: str | None = None
@@ -109,11 +110,30 @@ class ServiceWatch:
             start_command=[str(item) for item in payload.get("start_command", [])],
             stop_command=[str(item) for item in payload.get("stop_command", [])],
             restart_command=[str(item) for item in payload.get("restart_command", [])],
+            control_timeout_seconds=_parse_control_timeout_seconds(payload),
             restart_settle_seconds=int(payload.get("restart_settle_seconds", 5)),
             tags=list(payload.get("tags") or []),
             analysis_profile=payload.get("analysis_profile"),
             analysis_config=dict(payload.get("analysis_config") or {}),
         )
+
+
+def _parse_control_timeout_seconds(payload: dict[str, Any]) -> dict[str, int]:
+    configured = payload.get("control_timeout_seconds")
+    timeouts: dict[str, int] = {}
+    if isinstance(configured, dict):
+        for operation in ("default", "start", "stop", "restart"):
+            value = configured.get(operation)
+            if value not in {None, ""}:
+                timeouts[operation] = int(value)
+    elif configured not in {None, ""}:
+        timeouts["default"] = int(configured)
+
+    for operation in ("start", "stop", "restart"):
+        value = payload.get(f"{operation}_timeout_seconds")
+        if value not in {None, ""}:
+            timeouts[operation] = int(value)
+    return timeouts
 
 
 @dataclass(slots=True)

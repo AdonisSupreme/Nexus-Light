@@ -1017,6 +1017,12 @@ def _control_postcheck_timeout_seconds(service: Any, operation: str) -> int:
 
 
 def _control_command_timeout_seconds(service: Any, operation: str) -> int:
+    configured_timeouts = getattr(service, "control_timeout_seconds", {}) or {}
+    if isinstance(configured_timeouts, dict):
+        override = configured_timeouts.get(operation, configured_timeouts.get("default"))
+        if override not in {None, ""}:
+            return min(max(int(override), 5), 600)
+
     configured = max(int(getattr(service, "restart_settle_seconds", 5) or 5), 1)
     if operation == "stop":
         return min(max(configured + 5, 12), 30)
