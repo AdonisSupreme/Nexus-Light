@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -13,6 +13,20 @@ LEVEL_RE = re.compile(r"\b(?P<level>TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|CR
 TRACE_ID_RE = re.compile(r"\b(?:ATE-Trace-ID|trace[_-]?id|correlation[_-]?id)=?(?P<trace>[A-Za-z0-9_.:-]+)")
 SQLSTATE_RE = re.compile(r"\bSQLSTATE(?:\s*[:=])?\s*(?P<code>[A-Z0-9]{5})\b", re.IGNORECASE)
 ORA_RE = re.compile(r"\b(?P<code>ORA-\d{5}|TNS-\d{5})\b", re.IGNORECASE)
+BARE_ATE_HEADER_RE = re.compile(
+    r"^\s*\[\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d{1,6})?\]\s+"
+    r"(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|CRITICAL)\s+\[[^\]]+\]\s*$"
+)
+ATE_EVENT_HEADER_RE = BARE_ATE_HEADER_RE
+TRACE_VALUE_RE = re.compile(
+    r"((?:ATE-Trace-ID|trace[_-]?id|correlation[_-]?id)=?\[?)[^\]\s]+",
+    re.IGNORECASE,
+)
+RESPONSE_PAYLOAD_RE = re.compile(r"(\bRESPONSE\s*=).*$", re.IGNORECASE)
+BEARER_VALUE_RE = re.compile(r"(\bAuthorization\s*=\s*Bearer\s+)\S+", re.IGNORECASE)
+LONG_NUMBER_RE = re.compile(r"(?<![\d.])\d{7,}(?![\d.])")
+
+MOBILE_USSD_PROFILES = {"mobile_ussd", "txn_mobile_ussd", "ussd"}
 
 
 @dataclass(slots=True)
@@ -36,9 +50,44 @@ class LogSignature:
         return payload
 
 
+def classify_log_lines(
+    log_lines: list[str],
+    *,
+    default_timestamp: datetime | None = None,
+    profile_name: str | None = None,
+) -> list[LogSignature]:
+    """Classify complete ATE events while retaining line mode for other formats."""
+    if not any(ATE_EVENT_HEADER_RE.match(line) for line in log_lines):
+        return [
+            signature
+            for line in log_lines
+            if (signature := classify_line(line, default_timestamp=default_timestamp))
+        ]
+
+    signatures: list[LogSignature] = []
+    for event in _group_ate_events(log_lines):
+        if _is_expected_profile_event(event, profile_name):
+            continue
+        signature = classify_line(event, default_timestamp=default_timestamp)
+        if signature is None:
+            continue
+        signature.message = _safe_event_excerpt(event)
+        signature.attributes = {
+            **(signature.attributes or {}),
+            "multiline_event": "\n" in event,
+            "sensitive_values_redacted": True,
+        }
+        signatures.append(signature)
+    return signatures
+
+
 def classify_line(line: str, default_timestamp: datetime | None = None) -> LogSignature | None:
     text = line.strip()
     if not text:
+        return None
+    # ATE writes the timestamp/level/thread header and message on separate lines.
+    # Classifying the bare header duplicates the real continuation-line evidence.
+    if BARE_ATE_HEADER_RE.match(text):
         return None
 
     lowered = text.lower()
@@ -160,6 +209,44 @@ def summarize_signatures(signatures: list[LogSignature]) -> list[dict[str, Any]]
 def _extract_level(text: str) -> str:
     match = LEVEL_RE.search(text)
     return match.group("level") if match else "INFO"
+
+
+def _group_ate_events(log_lines: list[str]) -> list[str]:
+    events: list[str] = []
+    current: list[str] = []
+    for line in log_lines:
+        if ATE_EVENT_HEADER_RE.match(line):
+            if current:
+                events.append("\n".join(current))
+            current = [line]
+        elif current:
+            current.append(line)
+        elif line.strip():
+            current = [line]
+    if current:
+        events.append("\n".join(current))
+    return events
+
+
+def _is_expected_profile_event(text: str, profile_name: str | None) -> bool:
+    if (profile_name or "").strip().lower() not in MOBILE_USSD_PROFILES:
+        return False
+    lowered = text.lower()
+    if "transactionprocessorimpl" in lowered and "transaction request failed with error" in lowered:
+        return True
+    if "the application is expired" in lowered:
+        return True
+    return False
+
+
+def _safe_event_excerpt(text: str) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    excerpt = " | ".join(lines[:2])
+    excerpt = TRACE_VALUE_RE.sub(r"\1redacted", excerpt)
+    excerpt = RESPONSE_PAYLOAD_RE.sub(r"\1[redacted]", excerpt)
+    excerpt = BEARER_VALUE_RE.sub(r"\1[redacted]", excerpt)
+    excerpt = LONG_NUMBER_RE.sub("[redacted-number]", excerpt)
+    return _truncate(excerpt, 1200)
 
 
 def _normalize_level(level: str) -> str:

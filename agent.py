@@ -17,8 +17,8 @@ from .command_server import AgentCommandServer
 from .config import AgentSettings, ServiceWatch
 from .logs import BoundedLogTailer, file_owner_summary
 from .procfs import enrich_cpu_percent, find_processes
-from .service_profiles import analyze_service_profile
-from .signatures import LogSignature, classify_line, summarize_signatures
+from .service_profiles import analyze_service_profile, filter_profile_generic_signatures
+from .signatures import LogSignature, classify_log_lines, summarize_signatures
 from .spool import BoundedSpool
 from .state import StateStore
 from .system import host_snapshot, resource_pressure
@@ -126,17 +126,28 @@ class NexusLightAgent:
                 max_lines=max_log_lines,
                 initial_tail_bytes=self.settings.resource_guard.initial_tail_bytes,
             )
-            signatures = [
-                signature
-                for line in log_lines
-                if (signature := classify_line(line, default_timestamp=now))
-            ]
+            signatures = classify_log_lines(
+                log_lines,
+                default_timestamp=now,
+                profile_name=service.analysis_profile,
+            )
             log_meta["configured"] = True
             log_meta["owner"] = file_owner_summary(service.log_path)
 
-        profile_analysis = analyze_service_profile(service, log_lines, default_timestamp=now)
+        profile_states = self.state.data.setdefault("service_profile_state", {})
+        profile_state = profile_states.setdefault(service.service_id, {})
+        profile_analysis = analyze_service_profile(
+            service,
+            log_lines,
+            default_timestamp=now,
+            state=profile_state,
+        )
         if profile_analysis:
-            signatures.extend(profile_analysis.signatures)
+            # Profile evidence is more specific than generic line classification.
+            signatures = [
+                *profile_analysis.signatures,
+                *filter_profile_generic_signatures(service.analysis_profile, signatures),
+            ]
 
         healthcheck = _run_health_check(service.healthcheck_url, timeout_seconds=3)
 
@@ -169,7 +180,7 @@ class NexusLightAgent:
             "business_flow_id": service.business_flow_id,
             "probe_family": "runtime_log_process",
             "vantage_point": "local_agent",
-            "observation_layer": "service_runtime",
+            "observation_layer": _observation_layer_for_failure_domain(failure_domain),
             "failure_domain_hint": failure_domain,
             "status": status,
             "severity": severity,
@@ -434,3 +445,15 @@ def _message_for(
     if pressure["collector_mode"] == "throttled":
         return f"{service.service_name} is being monitored in throttled mode due to host pressure."
     return f"{service.service_name} local runtime appears healthy."
+
+
+def _observation_layer_for_failure_domain(failure_domain: str) -> str:
+    if failure_domain == "database":
+        return "database"
+    if failure_domain in {"dependency", "network_or_dependency"}:
+        return "dependency_probe"
+    if failure_domain == "channel_tunnel":
+        return "channel"
+    if failure_domain == "host":
+        return "host"
+    return "service_runtime"

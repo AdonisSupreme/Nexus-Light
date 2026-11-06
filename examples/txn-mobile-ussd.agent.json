@@ -52,6 +52,12 @@
       "tags": ["mobile-banking", "ussd", "channel"],
       "analysis_profile": "mobile_ussd",
       "analysis_config": {
+        "health_window_seconds": 60,
+        "db_leak_warn_threshold": 2,
+        "db_leak_critical_threshold": 5,
+        "session_stall_min_requests": 5,
+        "session_stall_min_deficit": 3,
+        "session_stall_completion_ratio": 0.5,
         "session_expiry_burst_window_seconds": 60,
         "session_expiry_warn_threshold": 10,
         "session_expiry_critical_threshold": 30,
@@ -84,8 +90,19 @@
       "restart_command": ["sudo", "-n", "/opt/sentinel-nexus-control/txn-ussd-adapter/restart.sh"],
       "restart_settle_seconds": 30,
       "tags": ["mobile-banking", "ussd", "adapter", "channel-adapter"],
-      "analysis_profile": null,
-      "analysis_config": {}
+      "analysis_profile": "ussd_adapter",
+      "analysis_config": {
+        "flow_window_seconds": 60,
+        "minimum_requests": 5,
+        "failure_warn_threshold": 3,
+        "failure_critical_threshold": 10,
+        "minimum_dispatch_ratio": 0.8,
+        "minimum_completion_ratio": 0.5,
+        "minimum_outbound_ratio": 0.5,
+        "template_failure_warn_threshold": 2,
+        "smpp_timeout_warn_threshold": 3,
+        "dependency_service_id": "txn-mobile-ussd"
+      }
     }
   ]
 }
